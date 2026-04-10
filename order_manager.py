@@ -517,6 +517,39 @@ class OrderManager:
         to_cl=[]; changed=False
         for sym, pos in list(self.active_positions.items()):
             if sym in real_open:
+                # FIX: Emergency close daca pierderea e prea mare si SL nu s-a executat
+                real_p    = real_open.get(sym, {})
+                entry     = float(pos.get("entry", 0))
+                mark      = float(real_p.get("markPrice", entry) or entry)
+                direction = pos.get("direction","BUY")
+                if entry > 0 and mark > 0:
+                    if direction == "BUY":
+                        loss_pct = (mark - entry) / entry * 100
+                    else:
+                        loss_pct = (entry - mark) / entry * 100
+                    max_loss = -config.MAX_LOSS_PCT_EMERGENCY * 100
+                    if loss_pct < max_loss:
+                        logger.error(
+                            f"[EMERGENCY] {sym} pierde {loss_pct:.1f}% "
+                            f"(limita: {max_loss:.0f}%) — INCHID MARKET!"
+                        )
+                        try:
+                            qty = abs(float(real_p.get("positionAmt", pos.get("qty",0))))
+                            close_side = "SELL" if direction=="BUY" else "BUY"
+                            self.client.futures_create_order(
+                                symbol=sym, side=close_side,
+                                type="MARKET", quantity=qty, reduceOnly=True
+                            )
+                            logger.info(f"[EMERGENCY] {sym} inchis market!")
+                            try:
+                                from notifier import notify_error
+                                notify_error(
+                                    "EMERGENCY CLOSE",
+                                    f"{sym} inchis fortat: {loss_pct:.0f}% pierdere"
+                                )
+                            except Exception: pass
+                        except Exception as e:
+                            logger.error(f"[EMERGENCY] {sym} close error: {e}")
                 continue
             try:
                 open_ts = int(pos["open_ts"])
