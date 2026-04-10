@@ -42,9 +42,14 @@ DAILY_LOSS_LIMIT_PCT = 0.08   # 8% din capital/zi
 SCAN_INTERVAL_SEC = 60
 
 # ─── BLACKLIST ──────────────────────────────────────────────
+# ─── FILTRE SIGURANTA ──────────────────────────────────────
+MAX_LOSS_PCT_EMERGENCY = 0.30        # emergency close la -30%
+
 BLACKLIST = [
     "BTCDOMUSDT", "DEFIUSDT", "XPDUSDT",
     "1000WHYUSDT", "USDCUSDT", "INTCUSDT",
+    "PARTIUSDT", "TNSRUSDT", "DYMUSDT",
+    "HIPPOUSDT", "CROSSUSDT",
 ]
 
 # ─── TELEGRAM ───────────────────────────────────────────────
