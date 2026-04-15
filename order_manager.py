@@ -507,8 +507,10 @@ class OrderManager:
         if not self.active_positions:
             return False
         try:
+            all_positions = self.client.futures_position_information()
+            # DICT in loc de SET — avem nevoie de datele pozitiei (unRealizedProfit etc)
             real_open = {
-                p["symbol"] for p in self.client.futures_position_information()
+                p["symbol"]: p for p in all_positions
                 if abs(float(p["positionAmt"])) > 0
             }
         except Exception as e:
@@ -517,39 +519,38 @@ class OrderManager:
         to_cl=[]; changed=False
         for sym, pos in list(self.active_positions.items()):
             if sym in real_open:
-                # FIX: Emergency close daca pierderea e prea mare si SL nu s-a executat
-                real_p    = real_open.get(sym, {})
-                entry     = float(pos.get("entry", 0))
-                mark      = float(real_p.get("markPrice", entry) or entry)
-                direction = pos.get("direction","BUY")
-                if entry > 0 and mark > 0:
-                    if direction == "BUY":
-                        loss_pct = (mark - entry) / entry * 100
-                    else:
-                        loss_pct = (entry - mark) / entry * 100
-                    max_loss = -config.MAX_LOSS_PCT_EMERGENCY * 100
-                    if loss_pct < max_loss:
+                # Emergency close — folosim unRealizedProfit (nu miscare de pret)
+                try:
+                    real_p       = real_open[sym]
+                    unrealized   = float(real_p.get("unRealizedProfit", 0))
+                    lev          = getattr(config, "LEVERAGE", 10)
+                    upt          = getattr(config, "USDT_PER_TRADE", 7)
+                    # ROI Binance = unrealizedProfit / marja
+                    # marja = USDT_PER_TRADE, nu notional!
+                    max_loss_usd = -upt * config.MAX_LOSS_PCT_EMERGENCY
+                    if unrealized < max_loss_usd:
+                        roi_pct = unrealized / notional * 100
                         logger.error(
-                            f"[EMERGENCY] {sym} pierde {loss_pct:.1f}% "
-                            f"(limita: {max_loss:.0f}%) — INCHID MARKET!"
+                            f"[EMERGENCY] {sym} pierde {unrealized:.2f} USDT "
+                            f"({roi_pct:.0f}% ROI) — limita: {max_loss_usd:.2f} USDT — INCHID!"
                         )
                         try:
                             qty = abs(float(real_p.get("positionAmt", pos.get("qty",0))))
-                            close_side = "SELL" if direction=="BUY" else "BUY"
+                            cs  = "SELL" if float(real_p.get("positionAmt",0))>0 else "BUY"
                             self.client.futures_create_order(
-                                symbol=sym, side=close_side,
+                                symbol=sym, side=cs,
                                 type="MARKET", quantity=qty, reduceOnly=True
                             )
-                            logger.info(f"[EMERGENCY] {sym} inchis market!")
+                            logger.info(f"[EMERGENCY] {sym} inchis! PNL={unrealized:.2f}")
                             try:
                                 from notifier import notify_error
-                                notify_error(
-                                    "EMERGENCY CLOSE",
-                                    f"{sym} inchis fortat: {loss_pct:.0f}% pierdere"
-                                )
+                                notify_error("🚨 EMERGENCY CLOSE",
+                                    f"{sym}: {unrealized:.2f} USDT ({roi_pct:.0f}% ROI)")
                             except Exception: pass
                         except Exception as e:
                             logger.error(f"[EMERGENCY] {sym} close error: {e}")
+                except Exception as ee:
+                    logger.error(f"[EMERGENCY] check error {sym}: {ee}")
                 continue
             try:
                 open_ts = int(pos["open_ts"])
