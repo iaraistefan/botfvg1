@@ -12,6 +12,42 @@ from detector import FVGSetup
 import config
 from config import LEVERAGE, USDT_PER_TRADE
 
+
+
+def _save_state(pending, active, closed):
+    """Salveaza starea botului in JSON persistent."""
+    try:
+        sf = getattr(config, "STATE_FILE", "bot_state.json")
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump({
+                "pending_orders":   pending,
+                "active_positions": active,
+                "closed_trades":    closed,
+            }, f, indent=2)
+    except Exception as e:
+        logger.error(f"_save_state error: {e}")
+
+
+def _load_state():
+    """Incarca starea botului din JSON. Supravietuieste restart-urilor."""
+    try:
+        sf = getattr(config, "STATE_FILE", "bot_state.json")
+        if not os.path.exists(sf):
+            return {}, {}, []
+        with open(sf, encoding="utf-8") as f:
+            data = json.load(f)
+        p = data.get("pending_orders", {})
+        a = data.get("active_positions", {})
+        c = data.get("closed_trades", [])
+        if p or a:
+            logger.info(
+                f"[STATE] Restaurat: {len(p)} pending, {len(a)} active, {len(c)} closed"
+            )
+        return p, a, c
+    except Exception as e:
+        logger.error(f"_load_state error: {e}")
+        return {}, {}, []
+
 class OrderManager:
     def __init__(self, client: Client):
         self.client = client
