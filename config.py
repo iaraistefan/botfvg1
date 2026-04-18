@@ -36,14 +36,14 @@ EMA_PARALLEL_MAX = 4.0
 MAX_CONSEC_AGGR  = 1
 
 # ─── DAILY LOSS LIMIT ───────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT = 0.08   # 8% din capital/zi
+DAILY_LOSS_LIMIT_PCT = 0.20   # 20% din capital/zi
 
 # ─── SCANNING ───────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 60
 
 # ─── BLACKLIST ──────────────────────────────────────────────
 # ─── FILTRE SIGURANTA ──────────────────────────────────────
-MAX_LOSS_PCT_EMERGENCY = 0.30        # emergency close la -30%
+# MAX_LOSS_PCT_EMERGENCY eliminat — gestionat de Guardian extern
 
 BLACKLIST = [
     "BTCDOMUSDT", "DEFIUSDT", "XPDUSDT",
