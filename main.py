@@ -84,6 +84,11 @@ class FVGBot1H:
     # ─────────────────────────────────────────────
 
     def get_symbols(self) -> list:
+        # Cache 15 minute — exchangeInfo nu se schimba des
+        now_ts = time.time()
+        if (hasattr(self,"_symbols_cache") and self._symbols_cache
+                and now_ts - getattr(self,"_symbols_ts",0) < 900):
+            return self._symbols_cache
         try:
             info = self.client.futures_exchange_info()
             syms = [
@@ -93,6 +98,7 @@ class FVGBot1H:
                 and s["symbol"] not in config.BLACKLIST
             ]
             self._symbols_cache = syms
+            self._symbols_ts    = now_ts
             return syms
         except BinanceAPIException as e:
             if e.code == -1003:
@@ -100,7 +106,7 @@ class FVGBot1H:
                 time.sleep(60)
             else:
                 logger.error(f"get_symbols: {e}")
-            return self._symbols_cache
+            return getattr(self,"_symbols_cache",[])
 
     # ─────────────────────────────────────────────
     #  KLINES
@@ -213,23 +219,27 @@ class FVGBot1H:
             logger.info(f"PAUZA — {active}/{config.MAX_OPEN_TRADES} pozitii | {pending} pending")
             return
 
-        # 2. Capital estimat
-        try:
-            balance = self.client.futures_account_balance()
-            # Incearca mai multe campuri posibile
-            capital = 0.0
-            for b in balance:
-                if b.get("asset") == "USDT":
-                    # walletBalance = total, balance = disponibil
-                    val = float(b.get("walletBalance") or b.get("balance") or 0)
-                    if val > 0:
-                        capital = val
-                        break
-            if capital < 10:
-                capital = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES  # fallback rezonabil
-        except Exception as e:
-            logger.warning(f"Balance fetch error: {e}")
-            capital = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
+        # 2. Capital estimat — cache 10 minute (reduce API calls)
+        now_ts = time.time()
+        if not hasattr(self, "_capital_cache") or now_ts - getattr(self,"_capital_ts",0) > 600:
+            try:
+                balance = self.client.futures_account_balance()
+                capital = 0.0
+                for b in balance:
+                    if b.get("asset") == "USDT":
+                        val = float(b.get("walletBalance") or b.get("balance") or 0)
+                        if val > 0:
+                            capital = val; break
+                if capital < 10:
+                    capital = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
+                self._capital_cache = capital
+                self._capital_ts    = now_ts
+            except Exception as e:
+                logger.warning(f"Balance fetch error: {e}")
+                capital = getattr(self,"_capital_cache",
+                                  config.USDT_PER_TRADE * config.MAX_OPEN_TRADES)
+        else:
+            capital = self._capital_cache
 
         # 3. DLL check global
         if self._dll_active(capital):
