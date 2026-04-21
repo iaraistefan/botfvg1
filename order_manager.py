@@ -184,26 +184,28 @@ class OrderManager:
                      qty: float) -> bool:
         """
         Plaseaza SL sau TP folosind futures_create_order standard.
-        
-        De ce nu mai folosim algo orders (/fapi/v1/algoOrder):
-        - Algo orders au mai multe restrictii si pot fi refuzate
-        - futures_create_order e mai rapid, mai fiabil, mai putin restrictii
-        - STOP_MARKET si TAKE_PROFIT_MARKET sunt ordine standard Binance
+
+        FIX CRITIC (bazat pe documentatia Binance):
+        - workingType=MARK_PRICE: trigger pe Mark Price (acelasi ca ROI afisat)
+          CONTRACT_PRICE (Last Price) poate diverge 1-2% fata de Mark Price
+          la altcoins volatile → la 10x leverage = 10-20% ROI diferenta!
+        - closePosition=True: inchide toata pozitia, nu o cantitate fixa
+          evita desync la partial fills, prioritate anti-throttle la Binance
+        - timeInForce=GTC: GTE_GTC e legacy si poate genera -4129
         """
         label = "SL" if "STOP" in order_type else "TP"
         try:
             order = self.client.futures_create_order(
-                symbol      = symbol,
-                side        = side,
-                type        = order_type,
-                stopPrice   = str(trigger_price),
-                quantity    = str(qty),
-                reduceOnly  = True,
-                workingType = "CONTRACT_PRICE",
-                timeInForce = "GTE_GTC",   # Good Till Cancel
+                symbol        = symbol,
+                side          = side,
+                type          = order_type,
+                stopPrice     = str(trigger_price),
+                closePosition = True,        # inchide toata pozitia
+                workingType   = "MARK_PRICE",# trigger pe Mark Price = ROI real
+                timeInForce   = "GTC",       # nu GTE_GTC (legacy, genereaza -4129)
             )
             oid = order.get("orderId","?")
-            logger.info(f"[{symbol}] {label} plasat @ {trigger_price} | orderId={oid}")
+            logger.info(f"[{symbol}] {label} plasat @ {trigger_price} | orderId={oid} | workingType=MARK_PRICE")
             return True
         except BinanceAPIException as e:
             if e.code == -2021:
@@ -236,9 +238,10 @@ class OrderManager:
                     tp_r = self._round_price(trigger_price, tick, pp)
                     order = self.client.futures_create_order(
                         symbol=symbol, side=side, type=order_type,
-                        stopPrice=str(tp_r), quantity=str(qty),
-                        reduceOnly=True, workingType="CONTRACT_PRICE",
-                        timeInForce="GTE_GTC",
+                        stopPrice=str(tp_r),
+                        closePosition=True,
+                        workingType="MARK_PRICE",
+                        timeInForce="GTC",
                     )
                     logger.info(f"[{symbol}] {label} plasat (retry) @ {tp_r}")
                     return True
