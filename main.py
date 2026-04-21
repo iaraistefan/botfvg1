@@ -84,11 +84,11 @@ class FVGBot1H:
     # ─────────────────────────────────────────────
 
     def get_symbols(self) -> list:
-        # Cache 15 minute — exchangeInfo nu se schimba des
+        # Cache 15 minute — reduce API calls, evita IP ban
         now_ts = time.time()
-        if (hasattr(self,"_symbols_cache") and self._symbols_cache
-                and now_ts - getattr(self,"_symbols_ts",0) < 900):
-            return self._symbols_cache
+        cache  = getattr(self,"_symbols_cache",[])
+        if cache and (now_ts - getattr(self,"_symbols_ts",0) < 900):
+            return cache
         try:
             info = self.client.futures_exchange_info()
             syms = [
@@ -99,18 +99,24 @@ class FVGBot1H:
             ]
             self._symbols_cache = syms
             self._symbols_ts    = now_ts
+            logger.info(f"Simboluri actualizate: {len(syms)}")
             return syms
         except BinanceAPIException as e:
             if e.code == -1003:
-                logger.warning("Rate limit la get_symbols — astept 60s...")
+                logger.warning("Rate limit get_symbols — astept 60s si retry...")
                 time.sleep(60)
+                try:
+                    info = self.client.futures_exchange_info()
+                    syms = [s["symbol"] for s in info["symbols"]
+                            if s["symbol"].endswith("USDT")
+                            and s["status"]=="TRADING"
+                            and s["symbol"] not in config.BLACKLIST]
+                    self._symbols_cache = syms; self._symbols_ts = time.time()
+                    return syms
+                except Exception: return cache
             else:
                 logger.error(f"get_symbols: {e}")
-            return getattr(self,"_symbols_cache",[])
-
-    # ─────────────────────────────────────────────
-    #  KLINES
-    # ─────────────────────────────────────────────
+            return cache
 
     def get_klines(self, symbol: str) -> list:
         try:
