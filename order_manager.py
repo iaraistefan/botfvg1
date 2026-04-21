@@ -2,10 +2,10 @@
 Order Manager 1H — cu state persistent local
 Supravietuieste restart-urilor de PC prin bot_state_1h.json
 """
-import logging, hmac, hashlib, json, os
+import logging, json, os
 import time as t
-import requests as req
-from urllib.parse import urlencode
+
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from detector import FVGSetup
@@ -179,52 +179,78 @@ class OrderManager:
     def _calc_qty(self, entry, info):
         return round((USDT_PER_TRADE * LEVERAGE) / entry, info["qty_prec"])
 
-    def _algo_signed_post(self, params: dict) -> dict:
-        """POST la /fapi/v1/algoOrder — parametrii in body."""
-        params["timestamp"] = int(t.time() * 1000)
-        qs  = urlencode(params)
-        sig = hmac.new(
-            config.API_SECRET.encode("utf-8"),
-            qs.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        params["signature"] = sig
-        try:
-            resp = req.post(
-                FAPI + "/fapi/v1/algoOrder",
-                data    = params,
-                headers = {"X-MBX-APIKEY": config.API_KEY},
-                timeout = 15
-            )
-            return resp.json() if resp.text.strip() else {"error": f"Empty {resp.status_code}"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    # ─────────────────────────────────────────────
-    #  SL / TP
-    # ─────────────────────────────────────────────
-
-    def _place_conditional(self, symbol, side, order_type, trigger_price, qty) -> bool:
+    def _place_sl_tp(self, symbol: str, side: str,
+                     order_type: str, trigger_price: float,
+                     qty: float) -> bool:
+        """
+        Plaseaza SL sau TP folosind futures_create_order standard.
+        
+        De ce nu mai folosim algo orders (/fapi/v1/algoOrder):
+        - Algo orders au mai multe restrictii si pot fi refuzate
+        - futures_create_order e mai rapid, mai fiabil, mai putin restrictii
+        - STOP_MARKET si TAKE_PROFIT_MARKET sunt ordine standard Binance
+        """
         label = "SL" if "STOP" in order_type else "TP"
-        data  = self._algo_signed_post({
-            "algoType":     "CONDITIONAL",
-            "symbol":       symbol,
-            "side":         side,
-            "type":         order_type,
-            "triggerPrice": str(trigger_price),
-            "quantity":     str(qty),
-            "reduceOnly":   "true",
-            "workingType":  "CONTRACT_PRICE",
-        })
-        if "algoId" in data or "orderId" in data:
-            logger.info(f"[{symbol}] {label} @ {trigger_price} | algoId={data.get('algoId','?')}")
+        try:
+            order = self.client.futures_create_order(
+                symbol      = symbol,
+                side        = side,
+                type        = order_type,
+                stopPrice   = str(trigger_price),
+                quantity    = str(qty),
+                reduceOnly  = True,
+                workingType = "CONTRACT_PRICE",
+                timeInForce = "GTE_GTC",   # Good Till Cancel
+            )
+            oid = order.get("orderId","?")
+            logger.info(f"[{symbol}] {label} plasat @ {trigger_price} | orderId={oid}")
             return True
-        logger.error(f"[{symbol}] {label} ESUAT: {data}")
-        return False
-
-    # ─────────────────────────────────────────────
-    #  CHECK CYCLE
-    # ─────────────────────────────────────────────
+        except BinanceAPIException as e:
+            if e.code == -2021:
+                # Pretul deja dincolo de trigger — inchide imediat
+                logger.warning(
+                    f"[{symbol}] {label} -2021 (pret deja trecut) — inchid MARKET!"
+                )
+                try:
+                    self.client.futures_create_order(
+                        symbol=symbol, side=side,
+                        type="MARKET", quantity=qty, reduceOnly=True
+                    )
+                    logger.info(f"[{symbol}] Inchis MARKET dupa -2021")
+                    try:
+                        from notifier import notify_error
+                        notify_error("⚡ SL/TP executat instant",
+                                     f"{symbol}: pret deja la/dincolo de {label}")
+                    except Exception: pass
+                    return True  # pozitia e inchisa, consideram OK
+                except Exception as ce:
+                    logger.error(f"[{symbol}] Market close error: {ce}")
+                    return False
+            elif e.code == -1111:
+                # Precizie gresita — rotunjim si reincercam
+                logger.warning(f"[{symbol}] {label} precizie — reincerca: {e}")
+                try:
+                    info = self._get_symbol_info(symbol)
+                    pp   = info.get("price_prec", 4)
+                    tick = info.get("tick_size", 0.0001)
+                    tp_r = self._round_price(trigger_price, tick, pp)
+                    order = self.client.futures_create_order(
+                        symbol=symbol, side=side, type=order_type,
+                        stopPrice=str(tp_r), quantity=str(qty),
+                        reduceOnly=True, workingType="CONTRACT_PRICE",
+                        timeInForce="GTE_GTC",
+                    )
+                    logger.info(f"[{symbol}] {label} plasat (retry) @ {tp_r}")
+                    return True
+                except Exception as re:
+                    logger.error(f"[{symbol}] {label} retry esuat: {re}")
+                    return False
+            else:
+                logger.error(f"[{symbol}] {label} BinanceError {e.code}: {e.message}")
+                return False
+        except Exception as e:
+            logger.error(f"[{symbol}] {label} eroare: {e}")
+            return False
 
     def check_filled_orders(self):
         c1 = self._check_pending()
@@ -249,9 +275,9 @@ class OrderManager:
                     logger.info(f"[{sym}] UMPLUT la {filled} — SL+TP...")
                     t.sleep(0.5)
                     cs    = data["close_side"]
-                    sl_ok = self._place_conditional(sym, cs, "STOP_MARKET",        data["sl"], data["qty"])
+                    sl_ok = self._place_sl_tp(sym, cs, "STOP_MARKET",        data["sl"], data["qty"])
                     t.sleep(0.3)
-                    tp_ok = self._place_conditional(sym, cs, "TAKE_PROFIT_MARKET", data["tp"], data["qty"])
+                    tp_ok = self._place_sl_tp(sym, cs, "TAKE_PROFIT_MARKET", data["tp"], data["qty"])
                     if sl_ok and tp_ok:
                         logger.info(f"[{sym}] SL + TP plasate!")
                     elif not sl_ok:
