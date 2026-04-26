@@ -256,9 +256,9 @@ class FVGBot1H:
         self.om.reconcile_with_binance()
         logger.info("Bot 1H pornit. Ctrl+C pentru oprire.")
 
-        PENDING_INTERVAL = 20   # verifica ordine umplute la 20s (batch = 1 call)
-        ACTIVE_INTERVAL  = 45   # verifica pozitii inchise la 45s
-        SCAN_INTERVAL    = 90   # alterneaza cu 4H la 60s
+        PENDING_INTERVAL = 30   # verifica ordine umplute la 30s (reduce rate limit)
+        ACTIVE_INTERVAL  = 60   # verifica pozitii inchise la 60s
+        SCAN_INTERVAL    = 120   # alterneaza cu 4H la 60s
 
         last_pending = 0
         last_active  = 0
@@ -313,7 +313,7 @@ class FVGBot1H:
                         logger.info(f"PAUZA ZILNICA — DLL activ | {active} pozitii deschise")
 
                     else:
-                        symbols = self.get_symbols()[:150]
+                        symbols = self.get_symbols()[:100]
                         logger.info(f"Scanez {len(symbols)} perechi | "
                                     f"Pozitii: {active}/{config.MAX_OPEN_TRADES} | "
                                     f"Pending: {pending} | "
