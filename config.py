@@ -1,7 +1,3 @@
-"""
-FVG BOT 1H — Configurare
-Render: variabilele se seteaza in Environment Variables
-"""
 import os
 
 # ─── API ────────────────────────────────────────────────────
@@ -39,12 +35,10 @@ MAX_CONSEC_AGGR  = 1
 DAILY_LOSS_LIMIT_PCT = 0.20   # 20% din capital/zi
 
 # ─── SCANNING ───────────────────────────────────────────────
-SCAN_INTERVAL_SEC = 60
+SCAN_INTERVAL_SEC = 90   # 90s — alterneaza cu 4H (60s)
 
 # ─── BLACKLIST ──────────────────────────────────────────────
-# ─── FILTRE SIGURANTA ──────────────────────────────────────
 # MAX_LOSS_PCT_EMERGENCY eliminat — gestionat de Guardian extern
-
 BLACKLIST = [
     "BTCDOMUSDT", "DEFIUSDT", "XPDUSDT",
     "1000WHYUSDT", "USDCUSDT", "INTCUSDT",
