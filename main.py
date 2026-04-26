@@ -256,8 +256,8 @@ class FVGBot1H:
         self.om.reconcile_with_binance()
         logger.info("Bot 1H pornit. Ctrl+C pentru oprire.")
 
-        PENDING_INTERVAL = 10   # verifica ordine umplute la 10s
-        ACTIVE_INTERVAL  = 30   # verifica pozitii inchise la 30s (mai rar)
+        PENDING_INTERVAL = 20   # verifica ordine umplute la 20s (batch = 1 call)
+        ACTIVE_INTERVAL  = 45   # verifica pozitii inchise la 45s
         SCAN_INTERVAL    = 90   # alterneaza cu 4H la 60s
 
         last_pending = 0
