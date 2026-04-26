@@ -331,68 +331,87 @@ class OrderManager:
             self._save()
 
     def _check_pending(self) -> bool:
+        """
+        FIX RATE LIMIT: Un singur futures_get_open_orders() in loc de
+        cate un futures_get_order() per simbol. Reduce N calls → 1 call.
+        """
         if not self.pending_orders:
             return False
-        to_rm = []; changed = False
-        for sym, data in list(self.pending_orders.items()):
+        try:
+            # UN singur call pentru TOATE ordinele deschise
+            open_orders = self.client.futures_get_open_orders()
+            open_ids    = {str(o["orderId"]) for o in open_orders}
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger.warning("_check_pending: rate limit — skip")
+                return False
+            logger.error(f"_check_pending batch error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"_check_pending batch error: {e}")
+            return False
+
+        to_remove = []; changed = False
+        for symbol, data in list(self.pending_orders.items()):
+            order_id = str(data["order_id"])
+            if order_id in open_ids:
+                continue  # inca deschis, nu s-a umplut
+
+            # Ordinul nu mai e deschis — verifica daca e FILLED sau CANCELED
             try:
-                order  = self.client.futures_get_order(symbol=sym, orderId=data["order_id"])
+                order  = self.client.futures_get_order(symbol=symbol, orderId=data["order_id"])
                 status = order.get("status", "")
-
-                if status == "FILLED":
-                    filled = float(order.get("avgPrice", data["entry"]))
-                    logger.info(f"[{sym}] UMPLUT la {filled} — plasez SL+TP...")
-                    t.sleep(0.5)
-                    cs    = data["close_side"]
-                    sl_ok = self._place_sl_tp(sym, cs, "STOP_MARKET",        data["sl"], data["qty"])
-                    t.sleep(0.3)
-                    tp_ok = self._place_sl_tp(sym, cs, "TAKE_PROFIT_MARKET", data["tp"], data["qty"])
-                    if sl_ok and tp_ok:
-                        logger.info(f"[{sym}] SL+TP plasate ✅")
-                    elif not sl_ok:
-                        logger.warning(f"[{sym}] SL ESUAT — PERICOL!")
-
-                    try:
-                        from notifier import notify_trade_closed as _ntc
-                        pass  # notify_filled nu exista in 1H notifier, skip
-                    except Exception: pass
-
-                    self.active_positions[sym] = {
-                        "direction": data.get("direction", "?"),
-                        "entry":     filled,
-                        "sl":        data["sl"],
-                        "tp":        data["tp"],
-                        "qty":       data["qty"],
-                        "open_time": data.get("open_time", ""),
-                        "open_ts":   data.get("open_ts", int(t.time() * 1000)),
-                        "rsi":       data.get("rsi", 0.0),
-                        "slope":     data.get("slope", 0.0),
-                    }
-                    to_rm.append(sym); changed = True
-
-                elif status in ("CANCELED", "EXPIRED", "REJECTED"):
-                    logger.info(f"[{sym}] Ordin {status}")
-                    self.closed_trades.append({
-                        "symbol": sym, "direction": data.get("direction","?"),
-                        "entry": data.get("entry",0), "sl": data["sl"], "tp": data["tp"],
-                        "result": "EXPIRED", "pnl": 0.0,
-                        "open_time": data.get("open_time",""),
-                        "close_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
-                    })
-                    to_rm.append(sym); changed = True
-
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    logger.warning(f"[{sym}] check_pending rate limit — skip")
-                    break  # asteapta urmatorul ciclu
-                else:
-                    logger.error(f"[{sym}] check_pending: {e}")
+                    logger.warning(f"[{symbol}] check status rate limit — skip")
+                    break
+                logger.error(f"[{symbol}] get_order error: {e}")
+                continue
             except Exception as e:
-                logger.error(f"[{sym}] check_pending: {e}")
+                logger.error(f"[{symbol}] get_order error: {e}")
+                continue
 
-        for s in to_rm:
-            self.pending_orders.pop(s, None)
+            if status == "FILLED":
+                filled = float(order.get("avgPrice", data["entry"]))
+                logger.info(f"[{symbol}] UMPLUT la {filled} — plasez SL+TP...")
+                t.sleep(0.5)
+                cs    = data["close_side"]
+                sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET",        data["sl"], data["qty"])
+                t.sleep(0.3)
+                tp_ok = self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", data["tp"], data["qty"])
+                if sl_ok and tp_ok:
+                    logger.info(f"[{symbol}] SL+TP plasate ✅")
+                elif not sl_ok:
+                    logger.warning(f"[{symbol}] SL ESUAT — PERICOL!")
+
+                self.active_positions[symbol] = {
+                    "direction": data.get("direction", "?"),
+                    "entry":     filled,
+                    "sl":        data["sl"],
+                    "tp":        data["tp"],
+                    "qty":       data["qty"],
+                    "open_time": data.get("open_time", ""),
+                    "open_ts":   data.get("open_ts", int(t.time() * 1000)),
+                    "rsi":       data.get("rsi", 0.0),
+                    "slope":     data.get("slope", 0.0),
+                }
+                to_remove.append(symbol); changed = True
+
+            elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+                logger.info(f"[{symbol}] Ordin {status}")
+                self.closed_trades.append({
+                    "symbol": symbol, "direction": data.get("direction","?"),
+                    "entry": data.get("entry",0), "sl": data["sl"], "tp": data["tp"],
+                    "result": "EXPIRED", "pnl": 0.0,
+                    "open_time": data.get("open_time",""),
+                    "close_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
+                })
+                to_remove.append(symbol); changed = True
+
+        for sym in to_remove:
+            self.pending_orders.pop(sym, None)
         return changed
+
 
     def _check_active_positions(self) -> bool:
         if not self.active_positions:
