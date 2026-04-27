@@ -1,11 +1,12 @@
 """
-Order Manager 1H — v7
-Fix-uri aplicate:
-  1. open_ts = acum - 24h (nu -1h) → income_history gaseste PNL corect
-  2. SL/TP replasate dupa reconciliere (pozitii cu sl=0 sau tp=0)
-  3. Handler -1003 in _check_pending
-  4. MARK_PRICE + closePosition=True + GTC pentru SL/TP
-  5. reconcile NU importa la primul start (sigur — nu amesteca cu 4H)
+Order Manager 1H — v8 FINAL
+- Batch _check_pending (1 call total in loc de N)
+- _check_active cu handler -1003
+- MARK_PRICE + quantity + reduceOnly + GTC
+- Handler -4120 fallback CONTRACT_PRICE
+- _fix_missing_sl_tp dupa reconciliere
+- open_ts = -24h pentru income_history corect
+- daily_pnl persistent in JSON
 """
 import logging, json, os
 import time as t
@@ -20,7 +21,6 @@ logger = logging.getLogger("FVGBot1H")
 
 
 def _save_state(pending, active, closed, daily_pnl=None):
-    """Salveaza starea botului + DLL zilnic in JSON persistent."""
     try:
         sf = getattr(config, "STATE_FILE", "bot_state_1h.json")
         with open(sf, "w", encoding="utf-8") as f:
@@ -28,24 +28,23 @@ def _save_state(pending, active, closed, daily_pnl=None):
                 "pending_orders":   pending,
                 "active_positions": active,
                 "closed_trades":    closed,
-                "daily_pnl":        daily_pnl or {},  # FIX: DLL persistent
+                "daily_pnl":        daily_pnl or {},
             }, f, indent=2)
     except Exception as e:
         logger.error(f"_save_state error: {e}")
 
 
 def _load_state():
-    """Incarca starea botului + DLL zilnic."""
     try:
         sf = getattr(config, "STATE_FILE", "bot_state_1h.json")
         if not os.path.exists(sf):
             return {}, {}, [], {}
         with open(sf, encoding="utf-8") as f:
             data = json.load(f)
-        p  = data.get("pending_orders", {})
-        a  = data.get("active_positions", {})
-        c  = data.get("closed_trades", [])
-        dll= data.get("daily_pnl", {})  # FIX: DLL supravietuieste restartului
+        p   = data.get("pending_orders", {})
+        a   = data.get("active_positions", {})
+        c   = data.get("closed_trades", [])
+        dll = data.get("daily_pnl", {})
         if p or a:
             logger.info(f"[STATE] Restaurat: {len(p)} pending, {len(a)} active, {len(c)} closed")
         if dll:
@@ -62,9 +61,9 @@ class OrderManager:
         self._precision_cache = {}
         self.pending_orders, self.active_positions, self.closed_trades, self.daily_pnl = _load_state()
 
-    def _save(self, daily_pnl=None):
+    def _save(self):
         _save_state(self.pending_orders, self.active_positions,
-                    self.closed_trades, daily_pnl or self.daily_pnl)
+                    self.closed_trades, self.daily_pnl)
 
     # ─────────────────────────────────────────────
     #  RECONCILIERE LA STARTUP
@@ -72,30 +71,19 @@ class OrderManager:
 
     def reconcile_with_binance(self):
         """
-        La pornire: importa pozitiile botului 1H din Binance.
-        NU importa la primul start (evita amestecul cu botul 4H).
-        FIX: open_ts = acum - 24h pentru income_history corect.
-        FIX: Replaseaza SL/TP pentru pozitiile cu sl=0/tp=0.
+        La startup importa pozitiile + ordinele deschise.
+        FIX: open_ts = acum - 24h (income_history gaseste PNL corect).
+        FIX: Dupa import, _fix_missing_sl_tp() pune SL/TP pe pozitii fara protectie.
         """
-        if not os.path.exists(config.STATE_FILE):
-            logger.info("[RECONCILE] Primul start — nu importam pozitii externe")
-            return
-
-        # State exista dar are date — nu reimporta
-        if self.pending_orders or self.active_positions:
-            logger.info(f"[RECONCILE] State restaurat — {len(self.active_positions)} active, "
-                        f"{len(self.pending_orders)} pending")
-            # Totusi verifica daca au SL/TP si plaseaza daca lipsesc
-            self._fix_missing_sl_tp()
-            return
-
-        logger.info("[RECONCILE] State gol — sincronizez cu Binance...")
         try:
             positions = self.client.futures_position_information()
             open_pos  = [p for p in positions if abs(float(p["positionAmt"])) > 0]
 
             for p in open_pos:
-                symbol    = p["symbol"]
+                symbol = p["symbol"]
+                if symbol in self.active_positions:
+                    continue
+
                 amt       = float(p["positionAmt"])
                 entry     = float(p["entryPrice"])
                 direction = "BUY" if amt > 0 else "SELL"
@@ -113,7 +101,6 @@ class OrderManager:
                 except Exception:
                     pass
 
-                # FIX: open_ts = acum - 24h (nu -1h!)
                 self.active_positions[symbol] = {
                     "direction": direction,
                     "entry":     entry,
@@ -121,20 +108,20 @@ class OrderManager:
                     "tp":        tp_p,
                     "qty":       abs(amt),
                     "open_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
-                    "open_ts":   int(t.time() * 1000) - 86400000,  # FIX: -24h
+                    "open_ts":   int(t.time() * 1000) - 86400000,  # -24h
                     "rsi":       0.0,
                     "slope":     0.0,
                 }
                 logger.info(f"[RECONCILE] {symbol} {direction} @ {entry} (SL={sl_p} TP={tp_p})")
 
-            # Ordine LIMIT pending
+            # Ordine LIMIT pending — un singur batch call
             open_orders = self.client.futures_get_open_orders()
             for o in open_orders:
-                sym = o["symbol"]
-                if o.get("type") != "LIMIT" or sym in self.pending_orders:
+                symbol = o["symbol"]
+                if o.get("type") != "LIMIT" or symbol in self.pending_orders:
                     continue
                 side = o["side"]
-                self.pending_orders[sym] = {
+                self.pending_orders[symbol] = {
                     "order_id":   o["orderId"],
                     "sl":         0.0, "tp": 0.0,
                     "qty":        float(o["origQty"]),
@@ -145,13 +132,12 @@ class OrderManager:
                     "open_ts":    int(t.time() * 1000),
                     "rsi":        0.0, "slope": 0.0,
                 }
-                logger.info(f"[RECONCILE] Pending: {sym} {side} LIMIT @ {o['price']}")
+                logger.info(f"[RECONCILE] Pending: {symbol} {side} LIMIT @ {o['price']}")
 
             if open_pos or open_orders:
                 self._save()
-                logger.info(f"[RECONCILE] {len(self.active_positions)} active, "
+                logger.info(f"[RECONCILE] {len(self.active_positions)} pozitii, "
                             f"{len(self.pending_orders)} pending")
-                # FIX: Replaseaza SL/TP lipsa
                 self._fix_missing_sl_tp()
             else:
                 logger.info("[RECONCILE] Nicio pozitie deschisa")
@@ -165,29 +151,22 @@ class OrderManager:
 
     def _fix_missing_sl_tp(self):
         """
-        Dupa reconciliere, pozitiile cu SL=0 sau TP=0 nu au protectie.
-        Calculeaza si plaseaza SL/TP aproximativ (1.5% risk, 1:1 RR).
+        Pozitiile cu SL=0 sau TP=0 primesc SL/TP nou (1.5% risk, 1:1 RR).
         """
         fixed = 0
         for symbol, pos in list(self.active_positions.items()):
             if pos["sl"] > 0 and pos["tp"] > 0:
                 continue
 
-            entry     = pos["entry"]
-            direction = pos["direction"]
-            qty       = pos["qty"]
+            entry, direction, qty = pos["entry"], pos["direction"], pos["qty"]
             if entry <= 0:
                 continue
 
-            risk_pct = 0.015  # 1.5%
+            risk_pct = 0.015
             if direction == "BUY":
-                sl = entry * (1 - risk_pct)
-                tp = entry * (1 + risk_pct)
-                cs = "SELL"
+                sl, tp, cs = entry * (1 - risk_pct), entry * (1 + risk_pct), "SELL"
             else:
-                sl = entry * (1 + risk_pct)
-                tp = entry * (1 - risk_pct)
-                cs = "BUY"
+                sl, tp, cs = entry * (1 + risk_pct), entry * (1 - risk_pct), "BUY"
 
             try:
                 info = self._get_symbol_info(symbol)
@@ -198,37 +177,33 @@ class OrderManager:
             except Exception:
                 pass
 
-            logger.warning(f"[FIX-SL-TP] {symbol} lipseste protectie — plasez SL={sl} TP={tp}")
-            sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET",        sl, qty)
+            logger.warning(f"[FIX-SL-TP] {symbol} lipseste protectie — SL={sl} TP={tp}")
+            sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET", sl, qty)
             t.sleep(0.3)
             tp_ok = self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", tp, qty)
 
-            if sl_ok:
-                self.active_positions[symbol]["sl"] = sl
-            if tp_ok:
-                self.active_positions[symbol]["tp"] = tp
+            if sl_ok: self.active_positions[symbol]["sl"] = sl
+            if tp_ok: self.active_positions[symbol]["tp"] = tp
 
             if sl_ok and tp_ok:
                 logger.info(f"[FIX-SL-TP] {symbol} ✅ protejat")
                 fixed += 1
-            else:
-                logger.warning(f"[FIX-SL-TP] {symbol} partial esuat — Guardian protejeaza")
 
         if fixed > 0:
             self._save()
-            logger.info(f"[FIX-SL-TP] {fixed} pozitii protejate cu SL/TP nou")
+            logger.info(f"[FIX-SL-TP] {fixed} pozitii protejate")
 
     # ─────────────────────────────────────────────
     #  UTILS
     # ─────────────────────────────────────────────
 
-    def _get_symbol_info(self, symbol: str) -> dict:
+    def _get_symbol_info(self, symbol):
         if symbol not in self._precision_cache:
             info = self.client.futures_exchange_info()
             for s in info["symbols"]:
                 if s["symbol"] == symbol:
                     tick = float(next(f["tickSize"] for f in s["filters"]
-                                      if f["filterType"] == "PRICE_FILTER"))
+                                     if f["filterType"] == "PRICE_FILTER"))
                     self._precision_cache[symbol] = {
                         "price_prec": int(s["pricePrecision"]),
                         "qty_prec":   int(s["quantityPrecision"]),
@@ -244,70 +219,58 @@ class OrderManager:
         return round((USDT_PER_TRADE * LEVERAGE) / entry, info["qty_prec"])
 
     # ─────────────────────────────────────────────
-    #  SL / TP
+    #  SL / TP — MARK_PRICE + quantity + reduceOnly
     # ─────────────────────────────────────────────
 
     def _place_sl_tp(self, symbol, side, order_type, trigger_price, qty) -> bool:
-        """
-        FIX -4120: closePosition=True necesita algo endpoint.
-        Folosim quantity + reduceOnly=True pe endpoint standard.
-        MARK_PRICE: trigger = ROI afisat in Binance app.
-        """
         label = "SL" if "STOP" in order_type else "TP"
         try:
             order = self.client.futures_create_order(
-                symbol      = symbol,
-                side        = side,
-                type        = order_type,
-                stopPrice   = str(trigger_price),
-                quantity    = str(qty),
-                reduceOnly  = True,
-                workingType = "MARK_PRICE",
-                timeInForce = "GTC",
+                symbol=symbol, side=side, type=order_type,
+                stopPrice=str(trigger_price),
+                quantity=str(qty), reduceOnly=True,
+                workingType="MARK_PRICE", timeInForce="GTC",
             )
-            logger.info(f"[{symbol}] {label} @ {trigger_price} | "
-                        f"id={order.get('orderId','?')} | MARK_PRICE ✅")
+            logger.info(f"[{symbol}] {label} @ {trigger_price} | id={order.get('orderId','?')}")
             return True
         except BinanceAPIException as e:
             if e.code == -2021:
-                logger.warning(f"[{symbol}] {label} -2021 — pret trecut, inchid MARKET!")
+                # Pret deja trecut — inchide MARKET
+                logger.warning(f"[{symbol}] {label} -2021 — inchid MARKET!")
                 try:
                     self.client.futures_create_order(
                         symbol=symbol, side=side,
                         type="MARKET", quantity=qty, reduceOnly=True
                     )
-                    logger.info(f"[{symbol}] Inchis MARKET ✅")
                     return True
                 except Exception as ce:
                     logger.error(f"[{symbol}] Market close error: {ce}")
                     return False
             elif e.code == -1111:
+                # Precizie — retry cu rotunjire
                 try:
                     info = self._get_symbol_info(symbol)
                     tp_r = self._round_price(trigger_price,
                                              info.get("tick_size", 0.0001),
                                              info.get("price_prec", 4))
-                    order = self.client.futures_create_order(
+                    self.client.futures_create_order(
                         symbol=symbol, side=side, type=order_type,
                         stopPrice=str(tp_r), quantity=str(qty),
-                        reduceOnly=True, workingType="MARK_PRICE",
-                        timeInForce="GTC",
+                        reduceOnly=True, workingType="MARK_PRICE", timeInForce="GTC",
                     )
-                    logger.info(f"[{symbol}] {label} retry @ {tp_r} ✅")
                     return True
                 except Exception as re:
                     logger.error(f"[{symbol}] {label} retry esuat: {re}")
                     return False
             elif e.code == -4120:
-                # Fallback: incearca fara workingType (default CONTRACT_PRICE)
-                logger.warning(f"[{symbol}] {label} -4120 — retry fara MARK_PRICE...")
+                # Fallback CONTRACT_PRICE
                 try:
-                    order = self.client.futures_create_order(
+                    self.client.futures_create_order(
                         symbol=symbol, side=side, type=order_type,
                         stopPrice=str(trigger_price), quantity=str(qty),
                         reduceOnly=True, timeInForce="GTC",
                     )
-                    logger.info(f"[{symbol}] {label} plasat (CONTRACT_PRICE fallback) ✅")
+                    logger.info(f"[{symbol}] {label} CONTRACT_PRICE fallback ✅")
                     return True
                 except Exception as fe:
                     logger.error(f"[{symbol}] {label} fallback esuat: {fe}")
@@ -331,65 +294,56 @@ class OrderManager:
             self._save()
 
     def _check_pending(self) -> bool:
-        """
-        FIX RATE LIMIT: Un singur futures_get_open_orders() in loc de
-        cate un futures_get_order() per simbol. Reduce N calls → 1 call.
-        """
+        """BATCH: 1 call futures_get_open_orders pentru toate."""
         if not self.pending_orders:
             return False
         try:
-            # UN singur call pentru TOATE ordinele deschise
             open_orders = self.client.futures_get_open_orders()
             open_ids    = {str(o["orderId"]) for o in open_orders}
         except BinanceAPIException as e:
             if e.code == -1003:
                 logger.warning("_check_pending: rate limit — skip")
                 return False
-            logger.error(f"_check_pending batch error: {e}")
+            logger.error(f"_check_pending: {e}")
             return False
         except Exception as e:
-            logger.error(f"_check_pending batch error: {e}")
+            logger.error(f"_check_pending: {e}")
             return False
 
         to_remove = []; changed = False
         for symbol, data in list(self.pending_orders.items()):
-            order_id = str(data["order_id"])
-            if order_id in open_ids:
-                continue  # inca deschis, nu s-a umplut
+            if str(data["order_id"]) in open_ids:
+                continue  # inca deschis
 
-            # Ordinul nu mai e deschis — verifica daca e FILLED sau CANCELED
             try:
                 order  = self.client.futures_get_order(symbol=symbol, orderId=data["order_id"])
                 status = order.get("status", "")
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    logger.warning(f"[{symbol}] check status rate limit — skip")
                     break
-                logger.error(f"[{symbol}] get_order error: {e}")
+                logger.error(f"[{symbol}] get_order: {e}")
                 continue
             except Exception as e:
-                logger.error(f"[{symbol}] get_order error: {e}")
+                logger.error(f"[{symbol}] get_order: {e}")
                 continue
 
             if status == "FILLED":
                 filled = float(order.get("avgPrice", data["entry"]))
                 logger.info(f"[{symbol}] UMPLUT la {filled} — plasez SL+TP...")
                 t.sleep(0.5)
-                cs    = data["close_side"]
-                sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET",        data["sl"], data["qty"])
+                cs = data["close_side"]
+                sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET", data["sl"], data["qty"])
                 t.sleep(0.3)
                 tp_ok = self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", data["tp"], data["qty"])
                 if sl_ok and tp_ok:
                     logger.info(f"[{symbol}] SL+TP plasate ✅")
                 elif not sl_ok:
-                    logger.warning(f"[{symbol}] SL ESUAT — PERICOL!")
+                    logger.warning(f"[{symbol}] SL ESUAT — Guardian protejeaza")
 
                 self.active_positions[symbol] = {
                     "direction": data.get("direction", "?"),
                     "entry":     filled,
-                    "sl":        data["sl"],
-                    "tp":        data["tp"],
-                    "qty":       data["qty"],
+                    "sl":        data["sl"], "tp": data["tp"], "qty": data["qty"],
                     "open_time": data.get("open_time", ""),
                     "open_ts":   data.get("open_ts", int(t.time() * 1000)),
                     "rsi":       data.get("rsi", 0.0),
@@ -412,7 +366,6 @@ class OrderManager:
             self.pending_orders.pop(sym, None)
         return changed
 
-
     def _check_active_positions(self) -> bool:
         if not self.active_positions:
             return False
@@ -421,44 +374,46 @@ class OrderManager:
                          if abs(float(p["positionAmt"])) > 0}
         except BinanceAPIException as e:
             if e.code == -1003:
-                logger.warning("_check_active: rate limit — skip acest ciclu")
+                logger.warning("_check_active: rate limit — skip")
                 return False
-            logger.error(f"check_active: {e}"); return False
+            logger.error(f"_check_active: {e}")
+            return False
         except Exception as e:
-            logger.error(f"check_active: {e}"); return False
+            logger.error(f"_check_active: {e}")
+            return False
 
-        to_cl = []; changed = False
-        for sym, pos in list(self.active_positions.items()):
-            if sym in real_open:
+        to_close = []; changed = False
+        for symbol, pos in list(self.active_positions.items()):
+            if symbol in real_open:
                 continue
 
             try:
                 open_ts = int(pos["open_ts"])
                 end_ts  = int(t.time() * 1000)
                 income  = self.client.futures_income_history(
-                    symbol=sym, incomeType="REALIZED_PNL",
+                    symbol=symbol, incomeType="REALIZED_PNL",
                     startTime=open_ts, endTime=end_ts, limit=20
                 )
                 pnl = sum(float(x["income"]) for x in income) if income else 0.0
                 if pnl == 0.0 and not income:
-                    logger.warning(f"[{sym}] PNL=0 — retry urmator ciclu")
+                    logger.warning(f"[{symbol}] PNL=0 — retry urmator ciclu")
                     continue
 
                 result     = "TP" if pnl > 0 else "SL"
                 close_time = t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime())
                 sign       = "+" if pnl >= 0 else ""
-                logger.info(f"[{sym}] {'✅ TP' if result=='TP' else '❌ SL'} | PNL: {sign}{pnl:.4f} USDT")
+                logger.info(f"[{symbol}] {'✅ TP' if result=='TP' else '❌ SL'} | PNL: {sign}{pnl:.4f} USDT")
 
-                trade_rec = {
-                    "symbol": sym, "direction": pos["direction"],
+                trade_record = {
+                    "symbol": symbol, "direction": pos["direction"],
                     "entry": pos["entry"], "sl": pos["sl"], "tp": pos["tp"],
                     "result": result, "pnl": round(pnl, 4),
                     "open_time": pos["open_time"], "close_time": close_time,
                     "rsi": pos.get("rsi",0), "slope": pos.get("slope",0),
                 }
-                self.closed_trades.append(trade_rec)
+                self.closed_trades.append(trade_record)
 
-                # Actualizeaza DLL intern (main.py va prelua valoarea)
+                # Update DLL
                 today = t.strftime("%Y-%m-%d", t.gmtime())
                 self.daily_pnl[today] = self.daily_pnl.get(today, 0.0) + pnl
 
@@ -466,19 +421,19 @@ class OrderManager:
                     from notifier import notify_trade_closed
                     dur_h = (end_ts - open_ts) / 3600000
                     notify_trade_closed(
-                        symbol=sym, direction=pos["direction"],
+                        symbol=symbol, direction=pos["direction"],
                         entry=pos["entry"], sl=pos["sl"], tp=pos["tp"],
                         result=result, pnl_usdt=pnl,
                         open_time=pos["open_time"], close_time=close_time,
                         rsi=pos.get("rsi", 0.0), duration_h=dur_h,
                     )
                 except Exception as ne:
-                    logger.warning(f"[{sym}] notify error: {ne}")
+                    logger.warning(f"[{symbol}] notify error: {ne}")
 
                 try:
                     import journal
                     journal.log_trade(
-                        symbol=sym, direction=pos["direction"],
+                        symbol=symbol, direction=pos["direction"],
                         entry=pos["entry"], sl=pos["sl"], tp=pos["tp"],
                         result=result, pnl_usdt=pnl, usdt_per_trade=USDT_PER_TRADE,
                         open_time=pos["open_time"], close_time=close_time,
@@ -486,27 +441,27 @@ class OrderManager:
                     )
                 except Exception: pass
 
-                to_cl.append(sym); changed = True
+                to_close.append(symbol); changed = True
 
             except Exception as e:
-                logger.error(f"[{sym}] get PNL: {e}")
+                logger.error(f"[{symbol}] get PNL error: {e}")
 
-        for s in to_cl:
-            self.active_positions.pop(s, None)
+        for sym in to_close:
+            self.active_positions.pop(sym, None)
         return changed
 
     def _expire_old_orders(self) -> bool:
         expiry_ms = config.ORDER_EXPIRY_HOURS * 3600 * 1000
         now_ms    = int(t.time() * 1000)
-        to_exp = []; changed = False
-        for sym, oi in list(self.pending_orders.items()):
+        to_expire = []; changed = False
+        for symbol, oi in list(self.pending_orders.items()):
             if now_ms - oi.get("open_ts", now_ms) >= expiry_ms:
                 age_h = (now_ms - oi.get("open_ts", now_ms)) / 3600000
-                logger.info(f"[{sym}] Expirat dupa {age_h:.1f}h — anulez...")
+                logger.info(f"[{symbol}] Expirat dupa {age_h:.1f}h — anulez...")
                 try:
-                    self.client.futures_cancel_order(symbol=sym, orderId=oi["order_id"])
+                    self.client.futures_cancel_order(symbol=symbol, orderId=oi["order_id"])
                     self.closed_trades.append({
-                        "symbol": sym, "direction": oi.get("direction","?"),
+                        "symbol": symbol, "direction": oi.get("direction","?"),
                         "entry": oi.get("entry",0), "sl": oi["sl"], "tp": oi["tp"],
                         "result": "EXPIRED", "pnl": 0.0,
                         "open_time": oi.get("open_time",""),
@@ -514,10 +469,10 @@ class OrderManager:
                     })
                     changed = True
                 except Exception as e:
-                    logger.error(f"[{sym}] cancel: {e}")
-                to_exp.append(sym)
-        for s in to_exp:
-            self.pending_orders.pop(s, None)
+                    logger.error(f"[{symbol}] cancel: {e}")
+                to_expire.append(symbol)
+        for sym in to_expire:
+            self.pending_orders.pop(sym, None)
         return changed
 
     # ─────────────────────────────────────────────
@@ -555,7 +510,7 @@ class OrderManager:
     #  PLASARE TRADE
     # ─────────────────────────────────────────────
 
-    def set_leverage(self, symbol: str):
+    def set_leverage(self, symbol):
         try:
             self.client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
         except BinanceAPIException as e:
@@ -570,9 +525,11 @@ class OrderManager:
             entry_r = self._round_price(setup.entry, tick, pp)
             sl_r    = self._round_price(setup.sl,    tick, pp)
             tp_r    = self._round_price(setup.tp,    tick, pp)
-            if entry_r<=0 or sl_r<=0 or tp_r<=0: return False
+            if entry_r <= 0 or sl_r <= 0 or tp_r <= 0:
+                return False
             qty = self._calc_qty(entry_r, info)
-            if qty <= 0: return False
+            if qty <= 0:
+                return False
 
             self.set_leverage(symbol)
             side       = "BUY"  if setup.direction == "BULL" else "SELL"
@@ -585,8 +542,8 @@ class OrderManager:
                 timeInForce="GTC", quantity=qty, price=entry_r,
             )
             order_id = order["orderId"]
-            logger.info(f"[{symbol}] LIMIT {side} | id={order_id} | "
-                        f"qty={qty} | entry={entry_r} | sl={sl_r} | tp={tp_r}")
+            logger.info(f"[{symbol}] LIMIT {side} | id={order_id} | qty={qty} | "
+                        f"entry={entry_r} | sl={sl_r} | tp={tp_r}")
             self.pending_orders[symbol] = {
                 "order_id":   order_id,
                 "sl":         sl_r, "tp": tp_r, "qty": qty,
