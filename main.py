@@ -1,333 +1,678 @@
 """
-FVG BOT 1H — v5 FINAL
-- Scaneaza TOATE simbolurile (558 USDT futures)
-- Triple-loop: PENDING 30s + ACTIVE 60s + SCAN 240s
-- Delay 0.4s intre simboluri (max 2.5 calls/sec, safe)
-- NU mai opreste scan-ul la -1003 (continua cu next simbol)
-- DLL persistent + flotante
+Order Manager 1H — v8 FINAL
+- Batch _check_pending (1 call total in loc de N)
+- _check_active cu handler -1003
+- MARK_PRICE + quantity + reduceOnly + GTC
+- Handler -4120 fallback CONTRACT_PRICE
+- _fix_missing_sl_tp dupa reconciliere
+- open_ts = -24h pentru income_history corect
+- daily_pnl persistent in JSON
 """
-import sys, io, time, logging
-from datetime import datetime, timezone
+import logging, json, os
+import time as t
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-
+from detector import FVGSetup
 import config
-from detector import detect_fvg, prepare_df
-from order_manager import OrderManager
-from notifier import notify_setup, notify_trade, notify_error, send_statistics_report
+from config import LEVERAGE, USDT_PER_TRADE
 
-if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ]
-)
 logger = logging.getLogger("FVGBot1H")
 
 
-class FVGBot1H:
-    def __init__(self):
-        self.client           = Client(config.API_KEY, config.API_SECRET)
-        self.om               = OrderManager(self.client)
-        self.last_candle_ts   = {}
-        self.last_report_time = time.time()
-        self.stats = {"start": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+def _save_state(pending, active, closed, daily_pnl=None):
+    try:
+        sf = getattr(config, "STATE_FILE", "bot_state_1h.json")
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump({
+                "pending_orders":   pending,
+                "active_positions": active,
+                "closed_trades":    closed,
+                "daily_pnl":        daily_pnl or {},
+            }, f, indent=2)
+    except Exception as e:
+        logger.error(f"_save_state error: {e}")
 
-        logger.info("═══════════════════════════════════════════════════════")
-        logger.info("  FVG BOT 1H — v5 (scan complet)")
-        logger.info(f"  TF: {config.TIMEFRAME} | Leverage: {config.LEVERAGE}x | USDT/trade: {config.USDT_PER_TRADE}")
-        logger.info(f"  EMA: {config.EMA_FAST}/{config.EMA_SLOW} | Slope: {config.EMA_MIN_SLOPE*100:.1f}%/{config.EMA_SLOPE_BARS}bars")
-        logger.info(f"  Max pozitii: {config.MAX_OPEN_TRADES} | Expiry: {config.ORDER_EXPIRY_HOURS}h")
-        logger.info(f"  DLL: {config.DAILY_LOSS_LIMIT_PCT*100:.0f}% din capital/zi")
-        logger.info("═══════════════════════════════════════════════════════")
 
-    # ─── DLL ────────────────────────────────────────
+def _load_state():
+    try:
+        sf = getattr(config, "STATE_FILE", "bot_state_1h.json")
+        if not os.path.exists(sf):
+            return {}, {}, [], {}
+        with open(sf, encoding="utf-8") as f:
+            data = json.load(f)
+        p   = data.get("pending_orders", {})
+        a   = data.get("active_positions", {})
+        c   = data.get("closed_trades", [])
+        dll = data.get("daily_pnl", {})
+        if p or a:
+            logger.info(f"[STATE] Restaurat: {len(p)} pending, {len(a)} active, {len(c)} closed")
+        if dll:
+            logger.info(f"[STATE] DLL restaurat: {dll}")
+        return p, a, c, dll
+    except Exception as e:
+        logger.error(f"_load_state error: {e}")
+        return {}, {}, [], {}
 
-    def _today(self) -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def _get_capital(self) -> float:
-        now_ts = time.time()
-        if not hasattr(self, "_cap_cache") or now_ts - getattr(self, "_cap_ts", 0) > 600:
-            try:
-                bal = self.client.futures_account_balance()
-                cap = 0.0
-                for b in bal:
-                    if b.get("asset") == "USDT":
-                        v = float(b.get("walletBalance") or b.get("balance") or 0)
-                        if v > 0: cap = v; break
-                if cap < 10:
-                    cap = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
-                self._cap_cache = cap
-                self._cap_ts    = now_ts
-            except Exception as e:
-                logger.warning(f"Balance error: {e}")
-                cap = getattr(self, "_cap_cache",
-                              config.USDT_PER_TRADE * config.MAX_OPEN_TRADES)
-        else:
-            cap = self._cap_cache
-        return cap
+class OrderManager:
+    def __init__(self, client: Client):
+        self.client = client
+        self._precision_cache = {}
+        self.pending_orders, self.active_positions, self.closed_trades, self.daily_pnl = _load_state()
 
-    def _dll_active(self, capital: float) -> bool:
-        today        = self._today()
-        closed_loss  = self.om.daily_pnl.get(today, 0.0)
-        floating_loss = 0.0
+    def _save(self):
+        _save_state(self.pending_orders, self.active_positions,
+                    self.closed_trades, self.daily_pnl)
+
+    # ─────────────────────────────────────────────
+    #  RECONCILIERE LA STARTUP
+    # ─────────────────────────────────────────────
+
+    def reconcile_with_binance(self):
+        """
+        La startup importa pozitiile + ordinele deschise.
+        FIX: open_ts = acum - 24h (income_history gaseste PNL corect).
+        FIX: Dupa import, _fix_missing_sl_tp() pune SL/TP pe pozitii fara protectie.
+        """
         try:
-            if self.om.active_positions:
-                positions = self.client.futures_position_information()
-                for p in positions:
-                    if p["symbol"] in self.om.active_positions:
-                        u = float(p.get("unRealizedProfit", 0))
-                        if u < 0:
-                            floating_loss += u
-        except Exception:
-            pass
+            positions = self.client.futures_position_information()
+            open_pos  = [p for p in positions if abs(float(p["positionAmt"])) > 0]
 
-        total_loss = closed_loss + floating_loss
-        limit      = -(capital * config.DAILY_LOSS_LIMIT_PCT)
-        if total_loss <= limit:
-            logger.info(f"⛔ DLL activ: inchise={closed_loss:.2f} + flotante={floating_loss:.2f} "
-                        f"= {total_loss:.2f} (limita: {limit:.2f})")
-            return True
-        return False
+            for p in open_pos:
+                symbol = p["symbol"]
+                if symbol in self.active_positions:
+                    continue
 
-    # ─── SIMBOLURI + KLINES ────────────────────────
+                amt       = float(p["positionAmt"])
+                entry     = float(p["entryPrice"])
+                direction = "BUY" if amt > 0 else "SELL"
+                sl_p = tp_p = 0.0
 
-    def get_symbols(self) -> list:
-        now_ts = time.time()
-        cache  = getattr(self, "_symbols_cache", [])
-        if cache and (now_ts - getattr(self, "_symbols_ts", 0) < 900):
-            return cache
-        try:
-            info = self.client.futures_exchange_info()
-            syms = [s["symbol"] for s in info["symbols"]
-                    if s["symbol"].endswith("USDT")
-                    and s["status"] == "TRADING"
-                    and s["symbol"] not in config.BLACKLIST]
-            self._symbols_cache = syms
-            self._symbols_ts    = now_ts
-            logger.info(f"Simboluri actualizate: {len(syms)}")
-            return syms
-        except BinanceAPIException as e:
-            if e.code == -1003:
-                logger.warning("get_symbols: rate limit — sleep 30s + retry")
-                time.sleep(30)
                 try:
-                    info = self.client.futures_exchange_info()
-                    syms = [s["symbol"] for s in info["symbols"]
-                            if s["symbol"].endswith("USDT")
-                            and s["status"]=="TRADING"
-                            and s["symbol"] not in config.BLACKLIST]
-                    self._symbols_cache = syms
-                    self._symbols_ts = time.time()
-                    return syms
+                    orders = self.client.futures_get_open_orders(symbol=symbol)
+                    for o in orders:
+                        sp = float(o.get("stopPrice", 0))
+                        ot = o.get("type", "")
+                        if "STOP" in ot and sp > 0:
+                            sl_p = sp
+                        elif "PROFIT" in ot and sp > 0:
+                            tp_p = sp
                 except Exception:
-                    return cache
-            logger.error(f"get_symbols: {e}")
-            return cache
-        except Exception as e:
-            logger.error(f"get_symbols: {e}")
-            return cache
+                    pass
 
-    def get_klines(self, symbol: str) -> list:
+                self.active_positions[symbol] = {
+                    "direction": direction,
+                    "entry":     entry,
+                    "sl":        sl_p,
+                    "tp":        tp_p,
+                    "qty":       abs(amt),
+                    "open_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
+                    "open_ts":   int(t.time() * 1000) - 86400000,  # -24h
+                    "rsi":       0.0,
+                    "slope":     0.0,
+                }
+                logger.info(f"[RECONCILE] {symbol} {direction} @ {entry} (SL={sl_p} TP={tp_p})")
+
+            # Ordine LIMIT pending — un singur batch call
+            open_orders = self.client.futures_get_open_orders()
+            for o in open_orders:
+                symbol = o["symbol"]
+                if o.get("type") != "LIMIT" or symbol in self.pending_orders:
+                    continue
+                side = o["side"]
+                self.pending_orders[symbol] = {
+                    "order_id":   o["orderId"],
+                    "sl":         0.0, "tp": 0.0,
+                    "qty":        float(o["origQty"]),
+                    "close_side": "SELL" if side == "BUY" else "BUY",
+                    "entry":      float(o["price"]),
+                    "direction":  side,
+                    "open_time":  t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
+                    "open_ts":    int(t.time() * 1000),
+                    "rsi":        0.0, "slope": 0.0,
+                }
+                logger.info(f"[RECONCILE] Pending: {symbol} {side} LIMIT @ {o['price']}")
+
+            if open_pos or open_orders:
+                self._save()
+                logger.info(f"[RECONCILE] {len(self.active_positions)} pozitii, "
+                            f"{len(self.pending_orders)} pending")
+                self._fix_missing_sl_tp()
+            else:
+                logger.info("[RECONCILE] Nicio pozitie deschisa")
+
+        except Exception as e:
+            if "-1003" in str(e):
+                logger.warning("reconcile: rate limit — astept 60s...")
+                t.sleep(60)
+            else:
+                logger.error(f"reconcile error: {e}")
+
+    def _fix_missing_sl_tp(self):
+        """
+        Pozitiile cu SL=0 sau TP=0 primesc SL/TP nou (1.5% risk, 1:1 RR).
+        """
+        fixed = 0
+        for symbol, pos in list(self.active_positions.items()):
+            if pos["sl"] > 0 and pos["tp"] > 0:
+                continue
+
+            entry, direction, qty = pos["entry"], pos["direction"], pos["qty"]
+            if entry <= 0:
+                continue
+
+            risk_pct = 0.015
+            if direction == "BUY":
+                sl, tp, cs = entry * (1 - risk_pct), entry * (1 + risk_pct), "SELL"
+            else:
+                sl, tp, cs = entry * (1 + risk_pct), entry * (1 - risk_pct), "BUY"
+
+            try:
+                info = self._get_symbol_info(symbol)
+                tick = info.get("tick_size", 0.0001)
+                pp   = info.get("price_prec", 4)
+                sl   = self._round_price(sl, tick, pp)
+                tp   = self._round_price(tp, tick, pp)
+            except Exception:
+                pass
+
+            logger.warning(f"[FIX-SL-TP] {symbol} lipseste protectie — SL={sl} TP={tp}")
+            sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET", sl, qty)
+            t.sleep(0.3)
+            tp_ok = self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", tp, qty)
+
+            if sl_ok: self.active_positions[symbol]["sl"] = sl
+            if tp_ok: self.active_positions[symbol]["tp"] = tp
+
+            if sl_ok and tp_ok:
+                logger.info(f"[FIX-SL-TP] {symbol} ✅ protejat")
+                fixed += 1
+
+        if fixed > 0:
+            self._save()
+            logger.info(f"[FIX-SL-TP] {fixed} pozitii protejate")
+
+    # ─────────────────────────────────────────────
+    #  UTILS
+    # ─────────────────────────────────────────────
+
+    def _get_symbol_info(self, symbol):
+        if symbol not in self._precision_cache:
+            info = self.client.futures_exchange_info()
+            for s in info["symbols"]:
+                if s["symbol"] == symbol:
+                    tick = float(next(f["tickSize"] for f in s["filters"]
+                                     if f["filterType"] == "PRICE_FILTER"))
+                    self._precision_cache[symbol] = {
+                        "price_prec": int(s["pricePrecision"]),
+                        "qty_prec":   int(s["quantityPrecision"]),
+                        "tick_size":  tick,
+                    }
+                    break
+        return self._precision_cache.get(symbol, {})
+
+    def _round_price(self, price, tick, decimals):
+        return round(round(price / tick) * tick, decimals)
+
+    def _calc_qty(self, entry, info):
+        return round((USDT_PER_TRADE * LEVERAGE) / entry, info["qty_prec"])
+
+    # ─────────────────────────────────────────────
+    #  SL / TP — MARK_PRICE + quantity + reduceOnly
+    # ─────────────────────────────────────────────
+
+    def _place_sl_tp(self, symbol, side, order_type, trigger_price, qty) -> bool:
+        label = "SL" if "STOP" in order_type else "TP"
         try:
-            klines = self.client.futures_klines(
-                symbol=symbol, interval=config.TIMEFRAME, limit=200
+            order = self.client.futures_create_order(
+                symbol=symbol, side=side, type=order_type,
+                stopPrice=str(trigger_price),
+                quantity=str(qty), reduceOnly=True,
+                workingType="MARK_PRICE", timeInForce="GTC",
             )
-            return klines[:-1]
+            logger.info(f"[{symbol}] {label} @ {trigger_price} | id={order.get('orderId','?')}")
+            return True
+        except BinanceAPIException as e:
+            if e.code == -2021:
+                # Pret deja trecut — inchide MARKET
+                logger.warning(f"[{symbol}] {label} -2021 — inchid MARKET!")
+                try:
+                    self.client.futures_create_order(
+                        symbol=symbol, side=side,
+                        type="MARKET", quantity=qty, reduceOnly=True
+                    )
+                    return True
+                except Exception as ce:
+                    logger.error(f"[{symbol}] Market close error: {ce}")
+                    return False
+            elif e.code == -1111:
+                # Precizie — retry cu rotunjire
+                try:
+                    info = self._get_symbol_info(symbol)
+                    tp_r = self._round_price(trigger_price,
+                                             info.get("tick_size", 0.0001),
+                                             info.get("price_prec", 4))
+                    self.client.futures_create_order(
+                        symbol=symbol, side=side, type=order_type,
+                        stopPrice=str(tp_r), quantity=str(qty),
+                        reduceOnly=True, workingType="MARK_PRICE", timeInForce="GTC",
+                    )
+                    return True
+                except Exception as re:
+                    logger.error(f"[{symbol}] {label} retry esuat: {re}")
+                    return False
+            elif e.code == -4120:
+                # Fallback CONTRACT_PRICE
+                try:
+                    self.client.futures_create_order(
+                        symbol=symbol, side=side, type=order_type,
+                        stopPrice=str(trigger_price), quantity=str(qty),
+                        reduceOnly=True, timeInForce="GTC",
+                    )
+                    logger.info(f"[{symbol}] {label} CONTRACT_PRICE fallback ✅")
+                    return True
+                except Exception as fe:
+                    logger.error(f"[{symbol}] {label} fallback esuat: {fe}")
+                    return False
+            else:
+                logger.error(f"[{symbol}] {label} error {e.code}: {e.message}")
+                return False
+        except Exception as e:
+            logger.error(f"[{symbol}] {label} error: {e}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  CHECK CYCLE
+    # ─────────────────────────────────────────────
+
+    def check_filled_orders(self):
+        c1 = self._check_pending()
+        c2 = self._check_active_positions()
+        c3 = self._expire_old_orders()
+        if c1 or c2 or c3:
+            self._save()
+
+    def _check_pending(self) -> bool:
+        """BATCH: 1 call futures_get_open_orders pentru toate."""
+        if not self.pending_orders:
+            return False
+        try:
+            open_orders = self.client.futures_get_open_orders()
+            open_ids    = {str(o["orderId"]) for o in open_orders}
         except BinanceAPIException as e:
             if e.code == -1003:
-                # Soft throttle — sleep scurt si return [] (nu opri scan-ul!)
-                time.sleep(2)
-                return []
-            if e.code != -1121:
-                logger.warning(f"[{symbol}] klines: {e}")
-            return []
+                logger.warning("_check_pending: rate limit — skip")
+                return False
+            logger.error(f"_check_pending: {e}")
+            return False
         except Exception as e:
-            logger.warning(f"[{symbol}] klines: {e}")
-            return []
+            logger.error(f"_check_pending: {e}")
+            return False
 
-    # ─── SCAN ──────────────────────────────────────
+        to_remove = []; changed = False
+        for symbol, data in list(self.pending_orders.items()):
+            if str(data["order_id"]) in open_ids:
+                continue  # inca deschis
 
-    def scan_symbol(self, symbol: str, capital: float):
-        klines = self.get_klines(symbol)
-        if not klines:
-            return
-
-        df      = prepare_df(klines)
-        last_ts = df.index[-1]
-
-        if self.last_candle_ts.get(symbol) == last_ts:
-            return
-
-        setup = detect_fvg(symbol, df)
-        self.last_candle_ts[symbol] = last_ts  # set indiferent de rezultat
-
-        if setup is None:
-            return
-
-        logger.info(f"[{symbol}] FVG {setup.direction} | RSI={setup.rsi} | "
-                    f"Entry={setup.entry:.6f} | SL={setup.sl:.6f} | "
-                    f"TP={setup.tp:.6f} | Slope={setup.slope_fast:+.3f}%")
-
-        if self._dll_active(capital):
-            logger.info(f"[{symbol}] SKIP — DLL activ")
-            return
-
-        if self.om.has_symbol(symbol):
-            return
-
-        if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
-            logger.info(f"[{symbol}] SKIP — limita {config.MAX_OPEN_TRADES} atinsa")
-            return
-
-        notify_setup(setup)
-        success = self.om.place_fvg_trade(setup)
-        notify_trade(setup, success)
-
-    # ─── RAPORT ────────────────────────────────────
-
-    def check_and_send_report(self):
-        if time.time() - self.last_report_time >= config.TELEGRAM_REPORT_HOURS * 3600:
-            today    = self._today()
-            bstats   = self.om.get_bot_stats()
-            dll_today = self.om.daily_pnl.get(today, 0.0)
-            send_statistics_report({
-                "total_trades":   bstats["total"],
-                "wins":           bstats["wins"],
-                "losses":         bstats["losses"],
-                "expired_orders": bstats["expired"],
-                "pending":        bstats["pending"],
-                "open_positions": bstats["active"],
-                "pnl_total":      bstats["pnl_total"],
-                "pnl_today":      bstats["pnl_today"],
-                "win_rate":       bstats["win_rate"],
-                "best_trade":     bstats["best"],
-                "worst_trade":    bstats["worst"],
-                "commission_paid":0.0,
-                "start_time":     self.stats["start"],
-                "dll_today":      dll_today,
-                "timeframe":      config.TIMEFRAME,
-            })
-            self.last_report_time = time.time()
-            logger.info("Raport Telegram trimis.")
-
-    # ─── RUN — TRIPLE LOOP ─────────────────────────
-
-    def run(self):
-        """
-        - PENDING (30s): batch check ordine umplute
-        - ACTIVE  (60s): check pozitii inchise
-        - SCAN  (240s): scaneaza TOATE simbolurile
-
-        Scan complet 558 simboluri × 0.4s = ~223s = 3.7 min
-        Interval 240s = 4 min → suficient timp.
-        """
-        logger.info("Reconciliere cu Binance...")
-        self.om.reconcile_with_binance()
-        logger.info("Bot 1H pornit. Ctrl+C pentru oprire.")
-
-        PENDING_INTERVAL = 30
-        ACTIVE_INTERVAL  = 60
-        SCAN_INTERVAL    = 240   # 4 minute — suficient pentru scan complet
-
-        last_pending = 0
-        last_active  = 0
-        last_scan    = 0
-
-        while True:
             try:
-                now = time.time()
-
-                # ── PENDING (30s) ────────────────────
-                if now - last_pending >= PENDING_INTERVAL:
-                    try:
-                        c1 = self.om._check_pending()
-                        c3 = self.om._expire_old_orders()
-                        if c1 or c3:
-                            self.om._save()
-                    except BinanceAPIException as e:
-                        if e.code != -1003:
-                            logger.error(f"Pending check: {e}")
-                    except Exception as e:
-                        logger.error(f"Pending check: {e}")
-                    last_pending = time.time()
-
-                # ── ACTIVE (60s) ─────────────────────
-                if now - last_active >= ACTIVE_INTERVAL:
-                    try:
-                        c2 = self.om._check_active_positions()
-                        if c2:
-                            self.om._save()
-                    except BinanceAPIException as e:
-                        if e.code != -1003:
-                            logger.error(f"Active check: {e}")
-                    except Exception as e:
-                        logger.error(f"Active check: {e}")
-                    last_active = time.time()
-
-                # ── SCAN (240s) — TOATE SIMBOLURILE ──
-                if now - last_scan >= SCAN_INTERVAL:
-                    capital = self._get_capital()
-                    active  = self.om.count_active_trades()
-                    pending = len(self.om.pending_orders)
-
-                    if active >= config.MAX_OPEN_TRADES:
-                        logger.info(f"PAUZA — {active}/{config.MAX_OPEN_TRADES} pozitii")
-                    elif self._dll_active(capital):
-                        logger.info(f"PAUZA ZILNICA — DLL activ | {active} pozitii")
-                    else:
-                        # SCAN COMPLET — toate simbolurile
-                        symbols = self.get_symbols()
-                        scan_start = time.time()
-                        logger.info(f"SCAN COMPLET: {len(symbols)} perechi | "
-                                    f"Pozitii: {active}/{config.MAX_OPEN_TRADES} | "
-                                    f"Pending: {pending} | "
-                                    f"DLL azi: {self.om.daily_pnl.get(self._today(),0):+.2f} USDT")
-
-                        scanned = 0
-                        for sym in symbols:
-                            if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
-                                logger.info("Limita atinsa — opresc scan")
-                                break
-                            if self._dll_active(capital):
-                                logger.info("DLL atins — opresc scan")
-                                break
-                            try:
-                                self.scan_symbol(sym, capital)
-                                scanned += 1
-                            except BinanceAPIException as e:
-                                # NU opreste scan-ul — continua cu next simbol
-                                logger.error(f"[{sym}] BinanceError: {e}")
-                            except Exception as e:
-                                logger.error(f"[{sym}] Eroare: {e}")
-                            time.sleep(0.40)  # 400ms — safe rate
-
-                        scan_dur = time.time() - scan_start
-                        logger.info(f"Ciclu complet | {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | "
-                                    f"Scanate: {scanned}/{len(symbols)} in {scan_dur:.0f}s | "
-                                    f"Pozitii: {self.om.count_active_trades()}/{config.MAX_OPEN_TRADES}")
-
-                    self.check_and_send_report()
-                    last_scan = time.time()
-
-                time.sleep(2)
-
-            except KeyboardInterrupt:
-                logger.info("Bot oprit.")
-                break
+                order  = self.client.futures_get_order(symbol=symbol, orderId=data["order_id"])
+                status = order.get("status", "")
+            except BinanceAPIException as e:
+                if e.code == -1003:
+                    break
+                logger.error(f"[{symbol}] get_order: {e}")
+                continue
             except Exception as e:
-                logger.error(f"Eroare loop: {e}")
-                notify_error("Loop 1H", str(e))
-                time.sleep(10)
+                logger.error(f"[{symbol}] get_order: {e}")
+                continue
+
+            if status == "FILLED":
+                filled = float(order.get("avgPrice", data["entry"]))
+                logger.info(f"[{symbol}] UMPLUT la {filled} — plasez SL+TP...")
+                t.sleep(0.5)
+                cs = data["close_side"]
+                sl_ok = self._place_sl_tp(symbol, cs, "STOP_MARKET", data["sl"], data["qty"])
+                t.sleep(0.3)
+                tp_ok = self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", data["tp"], data["qty"])
+                if sl_ok and tp_ok:
+                    logger.info(f"[{symbol}] SL+TP plasate ✅")
+                elif not sl_ok:
+                    logger.warning(f"[{symbol}] SL ESUAT — Guardian protejeaza")
+
+                self.active_positions[symbol] = {
+                    "direction": data.get("direction", "?"),
+                    "entry":     filled,
+                    "sl":        data["sl"], "tp": data["tp"], "qty": data["qty"],
+                    "open_time": data.get("open_time", ""),
+                    "open_ts":   data.get("open_ts", int(t.time() * 1000)),
+                    "rsi":       data.get("rsi", 0.0),
+                    "slope":     data.get("slope", 0.0),
+                }
+                to_remove.append(symbol); changed = True
+
+            elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+                logger.info(f"[{symbol}] Ordin {status}")
+                self.closed_trades.append({
+                    "symbol": symbol, "direction": data.get("direction","?"),
+                    "entry": data.get("entry",0), "sl": data["sl"], "tp": data["tp"],
+                    "result": "EXPIRED", "pnl": 0.0,
+                    "open_time": data.get("open_time",""),
+                    "close_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
+                })
+                to_remove.append(symbol); changed = True
+
+        for sym in to_remove:
+            self.pending_orders.pop(sym, None)
+        return changed
 
 
-if __name__ == "__main__":
-    FVGBot1H().run()
+    # ─────────────────────────────────────────────
+    #  SL WATCHDOG — verifica si plaseaza SL lipsa
+    # ─────────────────────────────────────────────
+
+    def sl_watchdog(self):
+        """
+        Verifica TOATE pozitiile active si plaseaza SL/TP daca lipsesc.
+        Apelat la fiecare ACTIVE_INTERVAL (60s).
+        
+        Cazuri rezolvate:
+        - SL nu s-a plasat la FILLED
+        - SL a fost cancelat manual
+        - Pozitii reconciliate fara SL
+        - _fix_missing_sl_tp a esuat
+        """
+        if not self.active_positions:
+            return
+        
+        try:
+            # Un singur batch call pentru toate ordinele active
+            all_orders = self.client.futures_get_open_orders()
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                return  # rate limit, skip
+            logger.error(f"sl_watchdog: {e}")
+            return
+        except Exception as e:
+            logger.error(f"sl_watchdog: {e}")
+            return
+
+        # Grupez ordinele pe simbol
+        orders_by_symbol = {}
+        for o in all_orders:
+            sym = o["symbol"]
+            if sym not in orders_by_symbol:
+                orders_by_symbol[sym] = []
+            orders_by_symbol[sym].append(o)
+        
+        # Verific fiecare pozitie activa
+        for symbol, pos in list(self.active_positions.items()):
+            symbol_orders = orders_by_symbol.get(symbol, [])
+            
+            # Verific daca exista SL si TP pentru acest simbol
+            has_sl = any("STOP" in o.get("type","") for o in symbol_orders)
+            has_tp = any("PROFIT" in o.get("type","") for o in symbol_orders)
+            
+            if has_sl and has_tp:
+                continue  # totul OK
+            
+            # PROBLEMA: lipseste SL sau TP — plaseaza-le
+            entry     = pos["entry"]
+            direction = pos["direction"]
+            qty       = pos["qty"]
+            sl_price  = pos.get("sl", 0)
+            tp_price  = pos.get("tp", 0)
+            
+            if entry <= 0 or qty <= 0:
+                continue
+            
+            # Daca nu am SL/TP in state, calculez aproximativ (1.5% risk)
+            if sl_price <= 0 or tp_price <= 0:
+                risk_pct = 0.015
+                if direction == "BUY":
+                    sl_price = entry * (1 - risk_pct)
+                    tp_price = entry * (1 + risk_pct)
+                else:
+                    sl_price = entry * (1 + risk_pct)
+                    tp_price = entry * (1 - risk_pct)
+                try:
+                    info = self._get_symbol_info(symbol)
+                    tick = info.get("tick_size", 0.0001)
+                    pp   = info.get("price_prec", 4)
+                    sl_price = self._round_price(sl_price, tick, pp)
+                    tp_price = self._round_price(tp_price, tick, pp)
+                except Exception:
+                    pass
+            
+            cs = "SELL" if direction == "BUY" else "BUY"
+            
+            if not has_sl:
+                logger.warning(f"[WATCHDOG] {symbol} LIPSESTE SL — plasez @ {sl_price}")
+                if self._place_sl_tp(symbol, cs, "STOP_MARKET", sl_price, qty):
+                    self.active_positions[symbol]["sl"] = sl_price
+                    logger.info(f"[WATCHDOG] {symbol} SL plasat ✅")
+                else:
+                    logger.error(f"[WATCHDOG] {symbol} SL ESUAT — Guardian protejeaza")
+            
+            if not has_tp:
+                logger.warning(f"[WATCHDOG] {symbol} LIPSESTE TP — plasez @ {tp_price}")
+                if self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", tp_price, qty):
+                    self.active_positions[symbol]["tp"] = tp_price
+                    logger.info(f"[WATCHDOG] {symbol} TP plasat ✅")
+            
+            t.sleep(0.3)
+        
+        self._save()
+
+    def _check_active_positions(self) -> bool:
+        if not self.active_positions:
+            return False
+        try:
+            real_open = {p["symbol"] for p in self.client.futures_position_information()
+                         if abs(float(p["positionAmt"])) > 0}
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger.warning("_check_active: rate limit — skip")
+                return False
+            logger.error(f"_check_active: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"_check_active: {e}")
+            return False
+
+        to_close = []; changed = False
+        for symbol, pos in list(self.active_positions.items()):
+            if symbol in real_open:
+                continue
+
+            try:
+                open_ts = int(pos["open_ts"])
+                end_ts  = int(t.time() * 1000)
+                income  = self.client.futures_income_history(
+                    symbol=symbol, incomeType="REALIZED_PNL",
+                    startTime=open_ts, endTime=end_ts, limit=20
+                )
+                pnl = sum(float(x["income"]) for x in income) if income else 0.0
+                if pnl == 0.0 and not income:
+                    logger.warning(f"[{symbol}] PNL=0 — retry urmator ciclu")
+                    continue
+
+                result     = "TP" if pnl > 0 else "SL"
+                close_time = t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime())
+                sign       = "+" if pnl >= 0 else ""
+                logger.info(f"[{symbol}] {'✅ TP' if result=='TP' else '❌ SL'} | PNL: {sign}{pnl:.4f} USDT")
+
+                trade_record = {
+                    "symbol": symbol, "direction": pos["direction"],
+                    "entry": pos["entry"], "sl": pos["sl"], "tp": pos["tp"],
+                    "result": result, "pnl": round(pnl, 4),
+                    "open_time": pos["open_time"], "close_time": close_time,
+                    "rsi": pos.get("rsi",0), "slope": pos.get("slope",0),
+                }
+                self.closed_trades.append(trade_record)
+
+                # Update DLL
+                today = t.strftime("%Y-%m-%d", t.gmtime())
+                self.daily_pnl[today] = self.daily_pnl.get(today, 0.0) + pnl
+
+                try:
+                    from notifier import notify_trade_closed
+                    dur_h = (end_ts - open_ts) / 3600000
+                    notify_trade_closed(
+                        symbol=symbol, direction=pos["direction"],
+                        entry=pos["entry"], sl=pos["sl"], tp=pos["tp"],
+                        result=result, pnl_usdt=pnl,
+                        open_time=pos["open_time"], close_time=close_time,
+                        rsi=pos.get("rsi", 0.0), duration_h=dur_h,
+                    )
+                except Exception as ne:
+                    logger.warning(f"[{symbol}] notify error: {ne}")
+
+                try:
+                    import journal
+                    journal.log_trade(
+                        symbol=symbol, direction=pos["direction"],
+                        entry=pos["entry"], sl=pos["sl"], tp=pos["tp"],
+                        result=result, pnl_usdt=pnl, usdt_per_trade=USDT_PER_TRADE,
+                        open_time=pos["open_time"], close_time=close_time,
+                        rsi=pos.get("rsi",0), ema_slope=pos.get("slope",0),
+                    )
+                except Exception: pass
+
+                to_close.append(symbol); changed = True
+
+            except Exception as e:
+                logger.error(f"[{symbol}] get PNL error: {e}")
+
+        for sym in to_close:
+            self.active_positions.pop(sym, None)
+        return changed
+
+    def _expire_old_orders(self) -> bool:
+        expiry_ms = config.ORDER_EXPIRY_HOURS * 3600 * 1000
+        now_ms    = int(t.time() * 1000)
+        to_expire = []; changed = False
+        for symbol, oi in list(self.pending_orders.items()):
+            if now_ms - oi.get("open_ts", now_ms) >= expiry_ms:
+                age_h = (now_ms - oi.get("open_ts", now_ms)) / 3600000
+                logger.info(f"[{symbol}] Expirat dupa {age_h:.1f}h — anulez...")
+                try:
+                    self.client.futures_cancel_order(symbol=symbol, orderId=oi["order_id"])
+                    self.closed_trades.append({
+                        "symbol": symbol, "direction": oi.get("direction","?"),
+                        "entry": oi.get("entry",0), "sl": oi["sl"], "tp": oi["tp"],
+                        "result": "EXPIRED", "pnl": 0.0,
+                        "open_time": oi.get("open_time",""),
+                        "close_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
+                    })
+                    changed = True
+                except Exception as e:
+                    logger.error(f"[{symbol}] cancel: {e}")
+                to_expire.append(symbol)
+        for sym in to_expire:
+            self.pending_orders.pop(sym, None)
+        return changed
+
+    # ─────────────────────────────────────────────
+    #  STATISTICI
+    # ─────────────────────────────────────────────
+
+    def get_bot_stats(self) -> dict:
+        closed  = [x for x in self.closed_trades if x["result"] in ("TP","SL")]
+        expired = [x for x in self.closed_trades if x["result"] == "EXPIRED"]
+        if not closed:
+            return {"total":0,"wins":0,"losses":0,"expired":len(expired),
+                    "pnl_total":0.0,"pnl_today":0.0,"win_rate":0.0,
+                    "best":0.0,"worst":0.0,
+                    "active":len(self.active_positions),"pending":len(self.pending_orders)}
+        wins   = [x for x in closed if x["result"]=="TP"]
+        losses = [x for x in closed if x["result"]=="SL"]
+        pnls   = [x["pnl"] for x in closed]
+        today  = t.strftime("%Y-%m-%d", t.gmtime())
+        return {
+            "total":     len(closed),
+            "wins":      len(wins),
+            "losses":    len(losses),
+            "expired":   len(expired),
+            "pnl_total": round(sum(pnls), 4),
+            "pnl_today": round(sum(x["pnl"] for x in closed
+                                   if x.get("close_time","")[:10]==today), 4),
+            "win_rate":  round(len(wins)/len(closed)*100, 1),
+            "best":      round(max(pnls), 4),
+            "worst":     round(min(pnls), 4),
+            "active":    len(self.active_positions),
+            "pending":   len(self.pending_orders),
+        }
+
+    # ─────────────────────────────────────────────
+    #  PLASARE TRADE
+    # ─────────────────────────────────────────────
+
+    def set_leverage(self, symbol):
+        try:
+            self.client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        except BinanceAPIException as e:
+            logger.warning(f"[{symbol}] leverage: {e}")
+
+    def place_fvg_trade(self, setup: FVGSetup) -> bool:
+        symbol = setup.symbol
+        try:
+            info    = self._get_symbol_info(symbol)
+            tick    = info["tick_size"]
+            pp      = info["price_prec"]
+            entry_r = self._round_price(setup.entry, tick, pp)
+            sl_r    = self._round_price(setup.sl,    tick, pp)
+            tp_r    = self._round_price(setup.tp,    tick, pp)
+            if entry_r <= 0 or sl_r <= 0 or tp_r <= 0:
+                return False
+            qty = self._calc_qty(entry_r, info)
+            if qty <= 0:
+                return False
+
+            self.set_leverage(symbol)
+            side       = "BUY"  if setup.direction == "BULL" else "SELL"
+            close_side = "SELL" if setup.direction == "BULL" else "BUY"
+            open_ts    = int(t.time() * 1000)
+            open_time  = t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime())
+
+            order    = self.client.futures_create_order(
+                symbol=symbol, side=side, type="LIMIT",
+                timeInForce="GTC", quantity=qty, price=entry_r,
+            )
+            order_id = order["orderId"]
+            logger.info(f"[{symbol}] LIMIT {side} | id={order_id} | qty={qty} | "
+                        f"entry={entry_r} | sl={sl_r} | tp={tp_r}")
+            self.pending_orders[symbol] = {
+                "order_id":   order_id,
+                "sl":         sl_r, "tp": tp_r, "qty": qty,
+                "close_side": close_side, "entry": entry_r,
+                "direction":  side, "open_time": open_time,
+                "open_ts":    open_ts,
+                "rsi":        getattr(setup, "rsi", 0.0),
+                "slope":      getattr(setup, "slope_fast", 0.0),
+            }
+            self._save()
+            return True
+
+        except BinanceAPIException as e:
+            if e.code == -2019:
+                logger.warning(f"[{symbol}] margin insuficient")
+            else:
+                logger.error(f"[{symbol}] BinanceAPIException: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"[{symbol}] Eroare: {e}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  UTILITARE
+    # ─────────────────────────────────────────────
+
+    def count_active_trades(self):
+        return len(self.pending_orders) + len(self.active_positions)
+
+    def has_symbol(self, symbol):
+        return symbol in self.pending_orders or symbol in self.active_positions
+
+    def is_at_capacity(self):
+        return self.count_active_trades() >= config.MAX_OPEN_TRADES
