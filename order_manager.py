@@ -366,6 +366,104 @@ class OrderManager:
             self.pending_orders.pop(sym, None)
         return changed
 
+
+    # ─────────────────────────────────────────────
+    #  SL WATCHDOG — verifica si plaseaza SL lipsa
+    # ─────────────────────────────────────────────
+
+    def sl_watchdog(self):
+        """
+        Verifica TOATE pozitiile active si plaseaza SL/TP daca lipsesc.
+        Apelat la fiecare ACTIVE_INTERVAL (60s).
+        
+        Cazuri rezolvate:
+        - SL nu s-a plasat la FILLED
+        - SL a fost cancelat manual
+        - Pozitii reconciliate fara SL
+        - _fix_missing_sl_tp a esuat
+        """
+        if not self.active_positions:
+            return
+        
+        try:
+            # Un singur batch call pentru toate ordinele active
+            all_orders = self.client.futures_get_open_orders()
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                return  # rate limit, skip
+            logger.error(f"sl_watchdog: {e}")
+            return
+        except Exception as e:
+            logger.error(f"sl_watchdog: {e}")
+            return
+
+        # Grupez ordinele pe simbol
+        orders_by_symbol = {}
+        for o in all_orders:
+            sym = o["symbol"]
+            if sym not in orders_by_symbol:
+                orders_by_symbol[sym] = []
+            orders_by_symbol[sym].append(o)
+        
+        # Verific fiecare pozitie activa
+        for symbol, pos in list(self.active_positions.items()):
+            symbol_orders = orders_by_symbol.get(symbol, [])
+            
+            # Verific daca exista SL si TP pentru acest simbol
+            has_sl = any("STOP" in o.get("type","") for o in symbol_orders)
+            has_tp = any("PROFIT" in o.get("type","") for o in symbol_orders)
+            
+            if has_sl and has_tp:
+                continue  # totul OK
+            
+            # PROBLEMA: lipseste SL sau TP — plaseaza-le
+            entry     = pos["entry"]
+            direction = pos["direction"]
+            qty       = pos["qty"]
+            sl_price  = pos.get("sl", 0)
+            tp_price  = pos.get("tp", 0)
+            
+            if entry <= 0 or qty <= 0:
+                continue
+            
+            # Daca nu am SL/TP in state, calculez aproximativ (1.5% risk)
+            if sl_price <= 0 or tp_price <= 0:
+                risk_pct = 0.015
+                if direction == "BUY":
+                    sl_price = entry * (1 - risk_pct)
+                    tp_price = entry * (1 + risk_pct)
+                else:
+                    sl_price = entry * (1 + risk_pct)
+                    tp_price = entry * (1 - risk_pct)
+                try:
+                    info = self._get_symbol_info(symbol)
+                    tick = info.get("tick_size", 0.0001)
+                    pp   = info.get("price_prec", 4)
+                    sl_price = self._round_price(sl_price, tick, pp)
+                    tp_price = self._round_price(tp_price, tick, pp)
+                except Exception:
+                    pass
+            
+            cs = "SELL" if direction == "BUY" else "BUY"
+            
+            if not has_sl:
+                logger.warning(f"[WATCHDOG] {symbol} LIPSESTE SL — plasez @ {sl_price}")
+                if self._place_sl_tp(symbol, cs, "STOP_MARKET", sl_price, qty):
+                    self.active_positions[symbol]["sl"] = sl_price
+                    logger.info(f"[WATCHDOG] {symbol} SL plasat ✅")
+                else:
+                    logger.error(f"[WATCHDOG] {symbol} SL ESUAT — Guardian protejeaza")
+            
+            if not has_tp:
+                logger.warning(f"[WATCHDOG] {symbol} LIPSESTE TP — plasez @ {tp_price}")
+                if self._place_sl_tp(symbol, cs, "TAKE_PROFIT_MARKET", tp_price, qty):
+                    self.active_positions[symbol]["tp"] = tp_price
+                    logger.info(f"[WATCHDOG] {symbol} TP plasat ✅")
+            
+            t.sleep(0.3)
+        
+        self._save()
+
     def _check_active_positions(self) -> bool:
         if not self.active_positions:
             return False
