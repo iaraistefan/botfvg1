@@ -283,9 +283,9 @@ class FVGBot1H:
         self.om.reconcile_with_binance()
         logger.info("Bot 1H pornit. Ctrl+C pentru oprire.")
 
-        PENDING_INTERVAL = 30
-        ACTIVE_INTERVAL  = 60
-        SCAN_INTERVAL    = 700   # > durata reala scan (~500s) + buffer
+        PENDING_INTERVAL = 120   # 120s — scan dureaza 800-1000s, 30s era prea agresiv
+        ACTIVE_INTERVAL  = 120   # 120s — sincronizat cu pending
+        SCAN_INTERVAL    = 1200  # 1200s — mai mare decat durata reala (~1000s)
 
         last_pending = 0
         last_active  = 0
