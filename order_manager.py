@@ -287,6 +287,11 @@ class OrderManager:
             if symbol in real_open:
                 continue
 
+            # === MODIFICARE PENTRU PREVENIREA EROARII -1003 ===
+            # Binance are nevoie de cateva secunde sa proceseze PNL-ul dupa inchidere.
+            # Daca nu asteptam, botul spameaza serverul si primeste ban.
+            t.sleep(2) 
+
             try:
                 open_ts = int(pos["open_ts"])
                 end_ts  = int(t.time() * 1000)
@@ -295,8 +300,12 @@ class OrderManager:
                     startTime=open_ts, endTime=end_ts, limit=20
                 )
                 pnl = sum(float(x["income"]) for x in income) if income else 0.0
+                
                 if pnl == 0.0 and not income:
                     logger.warning(f"[{symbol}] PNL=0 — retry urmator ciclu")
+                    # === MODIFICARE PENTRU PREVENIREA EROARII -1003 ===
+                    # Adaugam inca un mic delay inainte de a relua ciclul pentru a calma cererile API
+                    t.sleep(3)
                     continue
 
                 result     = "TP" if pnl > 0 else "SL"
@@ -523,3 +532,4 @@ class OrderManager:
 
     def is_at_capacity(self):
         return self.count_active_trades() >= config.MAX_OPEN_TRADES
+
