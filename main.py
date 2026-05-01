@@ -270,7 +270,7 @@ class FVGBot1H:
         """
         Triple loop:
         - PENDING (30s):  batch check ordine umplute
-        - ACTIVE  (60s):  check pozitii inchise + SL watchdog
+        - ACTIVE  (60s):  check pozitii inchise (fara watchdog)
         - SCAN    (700s): scaneaza TOATE simbolurile
 
         700s ales pentru ca scan-ul real dureaza 470-700s.
@@ -309,13 +309,13 @@ class FVGBot1H:
                         logger.error(f"Pending check: {e}")
                     last_pending = time.time()
 
-                # ── ACTIVE (60s) — check + SL watchdog ───────
+                # ── ACTIVE (60s) — check pozitii ───────
                 if now - last_active >= ACTIVE_INTERVAL:
                     try:
                         c2 = self.om._check_active_positions()
                         if c2:
                             self.om._save()
-                        self.om.sl_watchdog()
+                        # LINIUTA STEARSA AICI: self.om.sl_watchdog() a fost eliminat.
                     except BinanceAPIException as e:
                         if e.code != -1003:
                             logger.error(f"Active check: {e}")
