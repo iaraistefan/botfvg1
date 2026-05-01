@@ -283,9 +283,9 @@ class FVGBot1H:
         self.om.reconcile_with_binance()
         logger.info("Bot 1H pornit. Ctrl+C pentru oprire.")
 
-        PENDING_INTERVAL = 300   # 5 min — scan consuma tot bugetul, Guardian protejeaza
-        ACTIVE_INTERVAL  = 300   # 5 min — sincronizat cu pending
-        SCAN_INTERVAL    = 1200  # 20 min — mai mare decat durata reala (~900s)
+        PENDING_INTERVAL = 30
+        ACTIVE_INTERVAL  = 60
+        SCAN_INTERVAL    = 700   # > durata reala scan (~500s) + buffer
 
         last_pending = 0
         last_active  = 0
@@ -294,14 +294,6 @@ class FVGBot1H:
         while True:
             try:
                 now = time.time()
-
-                # ── GLOBAL RATE LIMIT GUARD ──────────────────
-                if hasattr(self, "_banned_until") and now < self._banned_until:
-                    wait = self._banned_until - now
-                    if int(wait) % 60 == 0:  # log la fiecare minut
-                        logger.warning(f"IP banat — astept {wait:.0f}s...")
-                    time.sleep(2)
-                    continue
 
                 # ── PENDING (30s) ────────────────────────────
                 if now - last_pending >= PENDING_INTERVAL:
@@ -317,12 +309,13 @@ class FVGBot1H:
                         logger.error(f"Pending check: {e}")
                     last_pending = time.time()
 
-                # ── ACTIVE (60s) — check pozitii inchise de Guardian ─
+                # ── ACTIVE (60s) — check + SL watchdog ───────
                 if now - last_active >= ACTIVE_INTERVAL:
                     try:
                         c2 = self.om._check_active_positions()
                         if c2:
                             self.om._save()
+                        self.om.sl_watchdog()
                     except BinanceAPIException as e:
                         if e.code != -1003:
                             logger.error(f"Active check: {e}")
@@ -392,16 +385,6 @@ class FVGBot1H:
             except KeyboardInterrupt:
                 logger.info("Bot oprit.")
                 break
-            except BinanceAPIException as e:
-                if e.code == -1003:
-                    # IP banat — parseaza timpul din mesaj daca e posibil
-                    self._banned_until = time.time() + 120
-                    logger.warning(f"IP banat — pauza 120s")
-                    time.sleep(120)
-                else:
-                    logger.error(f"Eroare loop: {e}")
-                    notify_error("Loop 1H", str(e))
-                    time.sleep(10)
             except Exception as e:
                 logger.error(f"Eroare loop: {e}")
                 notify_error("Loop 1H", str(e))
