@@ -1,30 +1,45 @@
 """
-FVG Detector — WITH-TREND + EMA Slope + Anti-Overextension
+═══════════════════════════════════════════════════════════
+  FVG DETECTOR — v10 (după backtest v4)
+═══════════════════════════════════════════════════════════
+Modificări față de v9:
+  ✓ Filtru NOU: MIN_GAP_ATR_MULT — gap relativ la volatilitate (ATR)
+  ✓ Filtru NOU: RSI_BULL_MAX (overbought protection)
+  ✓ Logică entry NOUĂ: ENTRY_FILL_RATIO (mid-gap în loc de gap_top)
+  ✓ Câmpuri noi: gap_top, gap_bot, atr (transmise la guardian via state)
+  ✓ SL/TP cosmetic eliminat — Guardian gestionează exit dinamic
 """
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from config import (
-    MIN_GAP_PCT, MAX_WICK_RATIO, AGGR_FACTOR, AVG_BODY_PERIOD,
-    RSI_PERIOD, RSI_BULL, RSI_BEAR,
+    MIN_GAP_PCT, MIN_GAP_ATR_MULT, MAX_WICK_RATIO, AGGR_FACTOR, AVG_BODY_PERIOD,
+    RSI_PERIOD, RSI_BULL_MIN, RSI_BULL_MAX,
     EMA_FAST, EMA_SLOW, EMA_SLOPE_BARS, EMA_MIN_SLOPE,
-    EMA_PARALLEL_MIN, EMA_PARALLEL_MAX, MAX_CONSEC_AGGR
+    EMA_PARALLEL_MIN, EMA_PARALLEL_MAX, MAX_CONSEC_AGGR,
+    ENTRY_FILL_RATIO, ATR_PERIOD,
 )
 
 
 @dataclass
 class FVGSetup:
+    """
+    Setup FVG detectat. Conține TOATE info-urile necesare pentru:
+    - Plasarea ordinului LIMIT (entry)
+    - Tracking-ul de către Guardian (gap_top, gap_bot, atr)
+    """
     symbol:      str
     direction:   str
-    entry:       float
-    sl:          float
-    tp:          float
+    entry:       float           # Preț LIMIT (calculat din ENTRY_FILL_RATIO)
+    gap_top:     float           # Vârful gap-ului (referință Guardian)
+    gap_bot:     float           # Baza gap-ului (referință Guardian)
     gap_height:  float
     rsi:         float
     ema_fast:    float
     ema_slow:    float
     slope_fast:  float
+    atr:         float           # NOU — pentru context Guardian
     candle_time: pd.Timestamp
 
 
@@ -40,6 +55,15 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, min_periods=period, adjust=False).mean()
+
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ATR (Average True Range) — pentru filtru gap relativ la volatilitate."""
+    high_low   = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close  = (df["low"]  - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
 
 def prepare_df(raw_klines: list) -> pd.DataFrame:
@@ -73,12 +97,12 @@ def _check_ema_filters(df: pd.DataFrame, direction: str):
 
     if direction == "BULL":
         if slope_fast <= 0 or slope_slow <= 0:
-            return False, f"EMA descrescatoare", ef_now, es_now, slope_fast
+            return False, "EMA descrescatoare", ef_now, es_now, slope_fast
         if ef_now < es_now:
             return False, "EMA50 sub EMA100 in BULL", ef_now, es_now, slope_fast
     else:
         if slope_fast >= 0 or slope_slow >= 0:
-            return False, f"EMA crescatoare", ef_now, es_now, slope_fast
+            return False, "EMA crescatoare", ef_now, es_now, slope_fast
         if ef_now > es_now:
             return False, "EMA50 deasupra EMA100 in BEAR", ef_now, es_now, slope_fast
 
@@ -115,19 +139,21 @@ def _check_overextension(df: pd.DataFrame, avg_body: float, direction: str):
 
 
 def detect_fvg(symbol: str, df: pd.DataFrame) -> Optional[FVGSetup]:
-    min_len = max(AVG_BODY_PERIOD, RSI_PERIOD * 3, EMA_SLOW + EMA_SLOPE_BARS) + 10
+    min_len = max(AVG_BODY_PERIOD, RSI_PERIOD * 3, EMA_SLOW + EMA_SLOPE_BARS, ATR_PERIOD * 3) + 10
     if len(df) < min_len:
         return None
 
     df = df.copy()
     df["rsi"] = calc_rsi(df["close"], RSI_PERIOD)
+    df["atr"] = calc_atr(df, ATR_PERIOD)
 
     c0 = df.iloc[-1]
     c1 = df.iloc[-2]
     c2 = df.iloc[-3]
 
     rsi_c1 = c1["rsi"]
-    if pd.isna(rsi_c1):
+    atr_now = c0["atr"]
+    if pd.isna(rsi_c1) or pd.isna(atr_now) or atr_now <= 0:
         return None
 
     avg_body = df["body"].iloc[-(AVG_BODY_PERIOD + 3):-3].mean()
@@ -142,57 +168,77 @@ def detect_fvg(symbol: str, df: pd.DataFrame) -> Optional[FVGSetup]:
         return None
 
     current_price = c0["close"]
-    direction = entry = sl = tp = risk = None
+    direction = gap_top = gap_bot = None
 
-    if c1["close"] > c1["open"] and rsi_c1 >= RSI_BULL:
+    if c1["close"] > c1["open"]:
+        # ── BULL FVG ──
+        # RSI bands: BULL ∈ [RSI_BULL_MIN, RSI_BULL_MAX]
+        if rsi_c1 < RSI_BULL_MIN or rsi_c1 > RSI_BULL_MAX:
+            return None
         direction = "BULL"
-        gap_bot   = c2["high"]
-        gap_top   = c0["low"]
+        gap_bot   = c2["high"]   # baza gap (mai jos)
+        gap_top   = c0["low"]    # vârf gap (mai sus)
         if gap_top <= gap_bot:
             return None
-        if (gap_top - gap_bot) / current_price < MIN_GAP_PCT:
-            return None
-        entry = gap_top
-        sl    = gap_bot
-        risk  = entry - sl
-        tp    = entry + risk
 
-    elif c1["close"] < c1["open"] and rsi_c1 <= RSI_BEAR:
+    elif c1["close"] < c1["open"]:
+        # ── BEAR FVG ──
+        # Pentru BEAR: simetric → RSI ∈ [100-RSI_BULL_MAX, 100-RSI_BULL_MIN]
+        rsi_bear_min = 100 - RSI_BULL_MAX
+        rsi_bear_max = 100 - RSI_BULL_MIN
+        if rsi_c1 < rsi_bear_min or rsi_c1 > rsi_bear_max:
+            return None
         direction = "BEAR"
-        gap_top   = c2["low"]
-        gap_bot   = c0["high"]
+        # Pentru BEAR: gap se inversează (vârf sus, bază jos pentru convenție comună)
+        gap_top   = c2["low"]    # vârf gap (mai sus pentru BEAR e c2.low)
+        gap_bot   = c0["high"]   # bază gap (mai jos pentru BEAR e c0.high)
         if gap_top <= gap_bot:
             return None
-        if (gap_top - gap_bot) / current_price < MIN_GAP_PCT:
-            return None
-        entry = gap_bot
-        sl    = gap_top
-        risk  = sl - entry
-        tp    = entry - risk
     else:
         return None
 
-    if risk <= 0:
+    # ── FILTRU GAP minim (% din preț) ──
+    gap_height = gap_top - gap_bot
+    gap_pct    = gap_height / current_price
+    if gap_pct < MIN_GAP_PCT:
         return None
 
+    # ── FILTRU NOU: GAP minim relativ la ATR ──
+    if MIN_GAP_ATR_MULT > 0:
+        gap_atr_mult = gap_height / atr_now
+        if gap_atr_mult < MIN_GAP_ATR_MULT:
+            return None
+
+    # ── FILTRE EMA ──
     ema_ok, _, ef_val, es_val, slope_f = _check_ema_filters(df, direction)
     if not ema_ok:
         return None
 
+    # ── FILTRU SUPRAEXTINDERE ──
     ext_ok, _ = _check_overextension(df, avg_body, direction)
     if not ext_ok:
         return None
+
+    # ── CALCUL ENTRY cu ENTRY_FILL_RATIO ──
+    # ENTRY_FILL_RATIO=0.0 → entry la gap_top (BULL) / gap_bot (BEAR) — fill agresiv
+    # ENTRY_FILL_RATIO=0.5 → entry la mid-gap (recomandat din backtest)
+    # ENTRY_FILL_RATIO=1.0 → entry la gap_bot (BULL) / gap_top (BEAR) — fill foarte conservator
+    if direction == "BULL":
+        entry = gap_top - (gap_top - gap_bot) * ENTRY_FILL_RATIO
+    else:
+        entry = gap_bot + (gap_top - gap_bot) * ENTRY_FILL_RATIO
 
     return FVGSetup(
         symbol      = symbol,
         direction   = direction,
         entry       = entry,
-        sl          = sl,
-        tp          = tp,
-        gap_height  = risk,
+        gap_top     = gap_top,
+        gap_bot     = gap_bot,
+        gap_height  = gap_height,
         rsi         = round(rsi_c1, 1),
         ema_fast    = round(ef_val, 6),
         ema_slow    = round(es_val, 6),
         slope_fast  = round(slope_f * 100, 3),
+        atr         = round(atr_now, 6),
         candle_time = c0.name
     )
