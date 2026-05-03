@@ -1,13 +1,12 @@
 """
-FVG BOT 1H — v6 FINAL
-- Scaneaza TOATE simbolurile (551 USDT futures)
-- Triple-loop: PENDING 30s + ACTIVE 60s + SCAN 700s
-- SCAN_INTERVAL 700s — mai mare decat durata reala (~500s) pentru a evita
-  suprapunerea cu botul 4H si rate limit-urile Binance
-- _get_capital() cu cache 600s — apelat O SINGURA DATA per ciclu scan,
-  nu la fiecare simbol
-- DLL persistent + flotante
-- Delay 0.4s intre simboluri (safe rate)
+═══════════════════════════════════════════════════════════
+  FVG BOT 1H — v10 (după backtest v4)
+═══════════════════════════════════════════════════════════
+Modificări față de v6:
+  ✓ Fix rate limit: _dll_active cu cache 30s pentru floating loss
+    (înainte: 1 call/simbol × 435 simboluri/ciclu = 435 call-uri extra!)
+  ✓ Compatibil cu detector v10 (FVGSetup are gap_top/gap_bot/atr)
+  ✓ Compatibil cu Guardian v4 (Trailing+BE)
 """
 import sys, io, time, logging
 from datetime import datetime, timezone
@@ -43,27 +42,28 @@ class FVGBot1H:
         self.last_report_time = time.time()
         self.stats = {"start": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 
-        # Cache capital — initializat la None, incarcat prima data in run()
+        # Cache capital
         self._cap_cache = None
         self._cap_ts    = 0
 
+        # NOU: Cache floating loss (pentru DLL) — evită rate limit
+        self._floating_loss_cache = 0.0
+        self._floating_loss_ts    = 0
+
         logger.info("═══════════════════════════════════════════════════════")
-        logger.info("  FVG BOT 1H — v6 (scan complet, rate limit fix)")
+        logger.info("  FVG BOT 1H — v10 (Trailing+BE strategy din backtest v4)")
         logger.info(f"  TF: {config.TIMEFRAME} | Leverage: {config.LEVERAGE}x | USDT/trade: {config.USDT_PER_TRADE}")
-        logger.info(f"  EMA: {config.EMA_FAST}/{config.EMA_SLOW} | Slope: {config.EMA_MIN_SLOPE*100:.1f}%/{config.EMA_SLOPE_BARS}bars")
-        logger.info(f"  Max pozitii: {config.MAX_OPEN_TRADES} | Expiry: {config.ORDER_EXPIRY_HOURS}h")
+        logger.info(f"  Detector: GAP%≥{config.MIN_GAP_PCT*100:.2f} | ATR_MULT≥{config.MIN_GAP_ATR_MULT}")
+        logger.info(f"            RSI∈[{config.RSI_BULL_MIN},{config.RSI_BULL_MAX}] | AGGR={config.AGGR_FACTOR}")
+        logger.info(f"            Wick≤{config.MAX_WICK_RATIO} | EMA slope≥{config.EMA_MIN_SLOPE*100:.2f}%")
+        logger.info(f"  Entry: ENTRY_FILL_RATIO={config.ENTRY_FILL_RATIO} (mid-gap)")
+        logger.info(f"  Max poziții: {config.MAX_OPEN_TRADES} | Expiry: {config.ORDER_EXPIRY_HOURS}h")
         logger.info(f"  DLL: {config.DAILY_LOSS_LIMIT_PCT*100:.0f}% din capital/zi")
-        logger.info(f"  SCAN interval: 700s (evita suprapunere cu 4H)")
         logger.info("═══════════════════════════════════════════════════════")
 
     # ─── CAPITAL (cache 600s) ────────────────────────────────
 
     def _get_capital(self) -> float:
-        """
-        Returneaza capitalul din cont.
-        Cache 600s — apelat O SINGURA DATA la inceputul fiecarui ciclu scan,
-        NU la fiecare simbol (evita rate limit).
-        """
         now_ts = time.time()
         if self._cap_cache and (now_ts - self._cap_ts < 600):
             return self._cap_cache
@@ -87,7 +87,6 @@ class FVGBot1H:
                 logger.warning("_get_capital: rate limit — folosesc cache")
             else:
                 logger.warning(f"_get_capital error: {e}")
-            # Foloseste cache-ul vechi sau fallback
             if not self._cap_cache:
                 self._cap_cache = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
         except Exception as e:
@@ -97,20 +96,22 @@ class FVGBot1H:
 
         return self._cap_cache
 
-    # ─── DLL ────────────────────────────────────────────────
+    # ─── DLL (cu cache floating loss 30s) ─────────────────────
 
     def _today(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def _dll_active(self, capital: float) -> bool:
+    def _get_floating_loss(self) -> float:
         """
-        Verifica Daily Loss Limit.
-        Primeste capitalul ca parametru — NU face apel API suplimentar.
+        NOU — cache 30s pentru floating loss.
+        Înainte: 1 call la fiecare _dll_active() apel (× 435 simboluri/ciclu).
+        Acum: 1 call la 30s = max 2 call-uri/min.
         """
-        today        = self._today()
-        closed_loss  = self.om.daily_pnl.get(today, 0.0)
-        floating_loss = 0.0
+        now_ts = time.time()
+        if (now_ts - self._floating_loss_ts) < 30:
+            return self._floating_loss_cache
 
+        floating_loss = 0.0
         try:
             if self.om.active_positions:
                 positions = self.client.futures_position_information()
@@ -121,18 +122,28 @@ class FVGBot1H:
                             floating_loss += u
         except BinanceAPIException as e:
             if e.code == -1003:
-                pass  # skip flotante la rate limit
+                # rate limit — folosim cache vechi
+                return self._floating_loss_cache
         except Exception:
-            pass
+            return self._floating_loss_cache
+
+        self._floating_loss_cache = floating_loss
+        self._floating_loss_ts    = now_ts
+        return floating_loss
+
+    def _dll_active(self, capital: float) -> bool:
+        today        = self._today()
+        closed_loss  = self.om.daily_pnl.get(today, 0.0)
+        floating_loss = self._get_floating_loss()
 
         total_loss = closed_loss + floating_loss
         limit      = -(capital * config.DAILY_LOSS_LIMIT_PCT)
 
         if total_loss <= limit:
             logger.info(
-                f"⛔ DLL activ: inchise={closed_loss:.2f} + "
+                f"⛔ DLL activ: închise={closed_loss:.2f} + "
                 f"flotante={floating_loss:.2f} = {total_loss:.2f} "
-                f"(limita: {limit:.2f})"
+                f"(limită: {limit:.2f})"
             )
             return True
         return False
@@ -217,11 +228,10 @@ class FVGBot1H:
 
         logger.info(
             f"[{symbol}] FVG {setup.direction} | RSI={setup.rsi} | "
-            f"Entry={setup.entry:.6f} | SL={setup.sl:.6f} | "
-            f"TP={setup.tp:.6f} | Slope={setup.slope_fast:+.3f}%"
+            f"Entry={setup.entry:.6f} | Gap={setup.gap_bot:.6f}↔{setup.gap_top:.6f} | "
+            f"ATR={setup.atr:.6f} | Slope={setup.slope_fast:+.3f}%"
         )
 
-        # DLL check — capital deja calculat la inceputul ciclului
         if self._dll_active(capital):
             logger.info(f"[{symbol}] SKIP — DLL activ")
             return
@@ -230,7 +240,7 @@ class FVGBot1H:
             return
 
         if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
-            logger.info(f"[{symbol}] SKIP — limita {config.MAX_OPEN_TRADES} atinsa")
+            logger.info(f"[{symbol}] SKIP — limită {config.MAX_OPEN_TRADES} atinsă")
             return
 
         notify_setup(setup)
@@ -248,6 +258,7 @@ class FVGBot1H:
                 "total_trades":   bstats["total"],
                 "wins":           bstats["wins"],
                 "losses":         bstats["losses"],
+                "be":             bstats.get("be", 0),
                 "expired_orders": bstats["expired"],
                 "pending":        bstats["pending"],
                 "open_positions": bstats["active"],
@@ -267,25 +278,13 @@ class FVGBot1H:
     # ─── RUN — TRIPLE LOOP ──────────────────────────────────
 
     def run(self):
-        """
-        Triple loop:
-        - PENDING (30s):  batch check ordine umplute
-        - ACTIVE  (60s):  check pozitii inchise (fara watchdog)
-        - SCAN    (700s): scaneaza TOATE simbolurile
-
-        700s ales pentru ca scan-ul real dureaza 470-700s.
-        Astfel 1H si 4H nu se suprapun niciodata pe acelasi IP Render.
-
-        Capital citit O SINGURA DATA la inceputul fiecarui ciclu SCAN
-        si transmis ca parametru — NU la fiecare simbol.
-        """
         logger.info("Reconciliere cu Binance...")
         self.om.reconcile_with_binance()
         logger.info("Bot 1H pornit. Ctrl+C pentru oprire.")
 
         PENDING_INTERVAL = 30
         ACTIVE_INTERVAL  = 60
-        SCAN_INTERVAL    = 700   # > durata reala scan (~500s) + buffer
+        SCAN_INTERVAL    = 700
 
         last_pending = 0
         last_active  = 0
@@ -295,7 +294,7 @@ class FVGBot1H:
             try:
                 now = time.time()
 
-                # ── PENDING (30s) ────────────────────────────
+                # PENDING (30s)
                 if now - last_pending >= PENDING_INTERVAL:
                     try:
                         c1 = self.om._check_pending()
@@ -309,13 +308,12 @@ class FVGBot1H:
                         logger.error(f"Pending check: {e}")
                     last_pending = time.time()
 
-                # ── ACTIVE (60s) — check pozitii ───────
+                # ACTIVE (60s)
                 if now - last_active >= ACTIVE_INTERVAL:
                     try:
                         c2 = self.om._check_active_positions()
                         if c2:
                             self.om._save()
-                        # LINIUTA STEARSA AICI: self.om.sl_watchdog() a fost eliminat.
                     except BinanceAPIException as e:
                         if e.code != -1003:
                             logger.error(f"Active check: {e}")
@@ -323,22 +321,21 @@ class FVGBot1H:
                         logger.error(f"Active check: {e}")
                     last_active = time.time()
 
-                # ── SCAN (700s) — TOATE SIMBOLURILE ──────────
+                # SCAN (700s)
                 if now - last_scan >= SCAN_INTERVAL:
                     active  = self.om.count_active_trades()
                     pending = len(self.om.pending_orders)
 
                     if active >= config.MAX_OPEN_TRADES:
-                        logger.info(f"PAUZA — {active}/{config.MAX_OPEN_TRADES} pozitii")
+                        logger.info(f"PAUZĂ — {active}/{config.MAX_OPEN_TRADES} poziții")
                         self.check_and_send_report()
                         last_scan = time.time()
                         continue
 
-                    # Capital citit O SINGURA DATA per ciclu ──
                     capital = self._get_capital()
 
                     if self._dll_active(capital):
-                        logger.info(f"PAUZA ZILNICA — DLL activ | {active} pozitii")
+                        logger.info(f"PAUZĂ ZILNICĂ — DLL activ | {active} poziții")
                         self.check_and_send_report()
                         last_scan = time.time()
                         continue
@@ -347,7 +344,7 @@ class FVGBot1H:
                     scan_start = time.time()
                     logger.info(
                         f"SCAN COMPLET: {len(symbols)} perechi | "
-                        f"Pozitii: {active}/{config.MAX_OPEN_TRADES} | "
+                        f"Poziții: {active}/{config.MAX_OPEN_TRADES} | "
                         f"Pending: {pending} | "
                         f"DLL azi: {self.om.daily_pnl.get(self._today(), 0):+.2f} USDT"
                     )
@@ -355,7 +352,7 @@ class FVGBot1H:
                     scanned = 0
                     for sym in symbols:
                         if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
-                            logger.info("Limita atinsa — opresc scan")
+                            logger.info("Limită atinsă — opresc scan")
                             break
                         if self._dll_active(capital):
                             logger.info("DLL atins — opresc scan")
@@ -373,8 +370,8 @@ class FVGBot1H:
                     logger.info(
                         f"Ciclu complet | "
                         f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | "
-                        f"Scanate: {scanned}/{len(symbols)} in {scan_dur:.0f}s | "
-                        f"Pozitii: {self.om.count_active_trades()}/{config.MAX_OPEN_TRADES}"
+                        f"Scanate: {scanned}/{len(symbols)} în {scan_dur:.0f}s | "
+                        f"Poziții: {self.om.count_active_trades()}/{config.MAX_OPEN_TRADES}"
                     )
 
                     self.check_and_send_report()
