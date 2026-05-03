@@ -1,11 +1,12 @@
 """
-Order Manager 1H — v9 FINAL
-- FARA plasare SL/TP — Guardian extern se ocupa de inchidere pozitii
-- Batch _check_pending (1 call total)
-- _check_active cu handler -1003
-- open_ts = -24h pentru income_history corect
-- daily_pnl persistent in JSON
-- Eliminat: _place_sl_tp, _fix_missing_sl_tp, sl_watchdog
+═══════════════════════════════════════════════════════════
+  ORDER MANAGER 1H — v10 (după backtest v4)
+═══════════════════════════════════════════════════════════
+Modificări față de v9:
+  ✓ Detectează result granular: TP / SL / BE / TRAIL / EC (din PNL ROI)
+  ✓ Stochează gap_top, gap_bot, atr în state (pentru Guardian context)
+  ✓ Eliminat sl/tp cosmetic din state
+  ✓ Compatibil cu detector v10 (FVGSetup are gap_top/gap_bot)
 """
 import logging, json, os
 import time as t
@@ -54,6 +55,36 @@ def _load_state():
         return {}, {}, [], {}
 
 
+def _classify_result_by_roi(pnl_usdt: float) -> str:
+    """
+    Determină tipul de exit pe baza PNL în USDT:
+      pnl > 0 → în general TP/TRAIL (ambele sunt "win")
+      pnl ≈ 0 (-1% ROI ≈ -0.07 USDT) → BE (breakeven move)
+      pnl < BE region → SL
+      pnl < EC region → EC
+    
+    Pentru raportare avem nevoie de ROI:
+      pnl_usdt = USDT_PER_TRADE × ROI / 100 - commission
+      ROI ≈ pnl_usdt × 100 / USDT_PER_TRADE (ignorăm commission pentru clasificare)
+    """
+    if pnl_usdt >= 0.01:
+        # Win — fie TP fix, fie Trailing. Nu putem distinge perfect, raportăm "WIN"
+        return "WIN"
+    
+    # Approximate ROI (% pe USDT_PER_TRADE)
+    approx_roi = pnl_usdt * 100 / USDT_PER_TRADE if USDT_PER_TRADE > 0 else 0
+    
+    # Fees ~0.08% pe leverage 10 = ~0.8% ROI cost = ~0.056 USDT pentru 7 USDT
+    # BE move = -1% ROI = -0.07 USDT (acoperă fees)
+    # Deci tot ce e între -2% și 0% ROI e probabil BE
+    if approx_roi >= -2.0:
+        return "BE"
+    elif approx_roi >= -28.0:  # SL_NATURAL = -25%, dar cu slippage poate ajunge la -28
+        return "SL"
+    else:
+        return "EC"
+
+
 class OrderManager:
     def __init__(self, client: Client):
         self.client = client
@@ -64,16 +95,7 @@ class OrderManager:
         _save_state(self.pending_orders, self.active_positions,
                     self.closed_trades, self.daily_pnl)
 
-    # ─────────────────────────────────────────────
-    #  RECONCILIERE LA STARTUP
-    # ─────────────────────────────────────────────
-
     def reconcile_with_binance(self):
-        """
-        La startup importa pozitiile + ordinele deschise.
-        NU plaseaza SL/TP — Guardian extern se ocupa.
-        open_ts = acum - 24h pentru income_history corect.
-        """
         try:
             positions = self.client.futures_position_information()
             open_pos  = [p for p in positions if abs(float(p["positionAmt"])) > 0]
@@ -90,17 +112,17 @@ class OrderManager:
                 self.active_positions[symbol] = {
                     "direction": direction,
                     "entry":     entry,
-                    "sl":        0.0,
-                    "tp":        0.0,
                     "qty":       abs(amt),
                     "open_time": t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime()),
-                    "open_ts":   int(t.time() * 1000) - 86400000,  # -24h
+                    "open_ts":   int(t.time() * 1000) - 86400000,
                     "rsi":       0.0,
                     "slope":     0.0,
+                    "gap_top":   0.0,
+                    "gap_bot":   0.0,
+                    "atr":       0.0,
                 }
                 logger.info(f"[RECONCILE] {symbol} {direction} @ {entry}")
 
-            # Ordine LIMIT pending — un singur batch call
             open_orders = self.client.futures_get_open_orders()
             for o in open_orders:
                 symbol = o["symbol"]
@@ -117,6 +139,9 @@ class OrderManager:
                     "open_ts":    int(t.time() * 1000),
                     "rsi":        0.0,
                     "slope":      0.0,
+                    "gap_top":    0.0,
+                    "gap_bot":    0.0,
+                    "atr":        0.0,
                 }
                 logger.info(f"[RECONCILE] Pending: {symbol} {side} LIMIT @ {o['price']}")
 
@@ -135,10 +160,6 @@ class OrderManager:
                 t.sleep(60)
             else:
                 logger.error(f"reconcile error: {e}")
-
-    # ─────────────────────────────────────────────
-    #  UTILS
-    # ─────────────────────────────────────────────
 
     def _get_symbol_info(self, symbol):
         if symbol not in self._precision_cache:
@@ -163,10 +184,6 @@ class OrderManager:
     def _calc_qty(self, entry, info):
         return round((USDT_PER_TRADE * LEVERAGE) / entry, info["qty_prec"])
 
-    # ─────────────────────────────────────────────
-    #  CHECK CYCLE
-    # ─────────────────────────────────────────────
-
     def check_filled_orders(self):
         c1 = self._check_pending()
         c2 = self._check_active_positions()
@@ -175,11 +192,6 @@ class OrderManager:
             self._save()
 
     def _check_pending(self) -> bool:
-        """
-        BATCH: 1 call futures_get_open_orders pentru toate.
-        La FILLED — inregistreaza pozitia activa, NU plaseaza SL/TP.
-        Guardian extern monitorizeaza si inchide pozitia.
-        """
         if not self.pending_orders:
             return False
         try:
@@ -200,7 +212,7 @@ class OrderManager:
 
         for symbol, data in list(self.pending_orders.items()):
             if str(data["order_id"]) in open_ids:
-                continue  # inca deschis
+                continue
 
             try:
                 order  = self.client.futures_get_order(
@@ -219,20 +231,20 @@ class OrderManager:
             if status == "FILLED":
                 filled = float(order.get("avgPrice", data["entry"]))
                 logger.info(
-                    f"[{symbol}] UMPLUT la {filled} — "
-                    f"Guardian preia protectia"
+                    f"[{symbol}] UMPLUT la {filled} — Guardian preia protectia (Trailing+BE)"
                 )
 
                 self.active_positions[symbol] = {
                     "direction": data.get("direction", "?"),
                     "entry":     filled,
-                    "sl":        0.0,
-                    "tp":        0.0,
                     "qty":       data["qty"],
                     "open_time": data.get("open_time", ""),
                     "open_ts":   data.get("open_ts", int(t.time() * 1000)),
                     "rsi":       data.get("rsi", 0.0),
                     "slope":     data.get("slope", 0.0),
+                    "gap_top":   data.get("gap_top", 0.0),
+                    "gap_bot":   data.get("gap_bot", 0.0),
+                    "atr":       data.get("atr", 0.0),
                 }
                 to_remove.append(symbol)
                 changed = True
@@ -243,8 +255,6 @@ class OrderManager:
                     "symbol":     symbol,
                     "direction":  data.get("direction", "?"),
                     "entry":      data.get("entry", 0),
-                    "sl":         0.0,
-                    "tp":         0.0,
                     "result":     "EXPIRED",
                     "pnl":        0.0,
                     "open_time":  data.get("open_time", ""),
@@ -258,11 +268,6 @@ class OrderManager:
         return changed
 
     def _check_active_positions(self) -> bool:
-        """
-        Verifica pozitii inchise de Guardian.
-        Cand Guardian inchide o pozitie MARKET, ea dispare din Binance
-        si botul inregistreaza PNL-ul real.
-        """
         if not self.active_positions:
             return False
         try:
@@ -287,10 +292,7 @@ class OrderManager:
             if symbol in real_open:
                 continue
 
-            # === MODIFICARE PENTRU PREVENIREA EROARII -1003 ===
-            # Binance are nevoie de cateva secunde sa proceseze PNL-ul dupa inchidere.
-            # Daca nu asteptam, botul spameaza serverul si primeste ban.
-            t.sleep(2) 
+            t.sleep(2)  # delay pentru procesare PNL Binance
 
             try:
                 open_ts = int(pos["open_ts"])
@@ -300,38 +302,40 @@ class OrderManager:
                     startTime=open_ts, endTime=end_ts, limit=20
                 )
                 pnl = sum(float(x["income"]) for x in income) if income else 0.0
-                
+
                 if pnl == 0.0 and not income:
                     logger.warning(f"[{symbol}] PNL=0 — retry urmator ciclu")
-                    # === MODIFICARE PENTRU PREVENIREA EROARII -1003 ===
-                    # Adaugam inca un mic delay inainte de a relua ciclul pentru a calma cererile API
                     t.sleep(3)
                     continue
 
-                result     = "TP" if pnl > 0 else "SL"
+                # Clasificare granular pe baza ROI
+                result = _classify_result_by_roi(pnl)
                 close_time = t.strftime("%Y-%m-%dT%H:%M:%SZ", t.gmtime())
-                sign       = "+" if pnl >= 0 else ""
+                sign = "+" if pnl >= 0 else ""
+                
+                emoji_map = {"WIN": "✅", "BE": "🟡", "SL": "❌", "EC": "🔴"}
+                emoji = emoji_map.get(result, "⚪")
+                
                 logger.info(
-                    f"[{symbol}] {'✅ TP' if result == 'TP' else '❌ SL'} "
-                    f"| PNL: {sign}{pnl:.4f} USDT (inchis de Guardian)"
+                    f"[{symbol}] {emoji} {result} | PNL: {sign}{pnl:.4f} USDT (Guardian)"
                 )
 
                 trade_record = {
                     "symbol":     symbol,
                     "direction":  pos["direction"],
                     "entry":      pos["entry"],
-                    "sl":         pos.get("sl", 0),
-                    "tp":         pos.get("tp", 0),
                     "result":     result,
                     "pnl":        round(pnl, 4),
                     "open_time":  pos["open_time"],
                     "close_time": close_time,
                     "rsi":        pos.get("rsi", 0),
                     "slope":      pos.get("slope", 0),
+                    "gap_top":    pos.get("gap_top", 0),
+                    "gap_bot":    pos.get("gap_bot", 0),
+                    "atr":        pos.get("atr", 0),
                 }
                 self.closed_trades.append(trade_record)
 
-                # Update DLL
                 today = t.strftime("%Y-%m-%d", t.gmtime())
                 self.daily_pnl[today] = self.daily_pnl.get(today, 0.0) + pnl
 
@@ -342,8 +346,6 @@ class OrderManager:
                         symbol=symbol,
                         direction=pos["direction"],
                         entry=pos["entry"],
-                        sl=pos.get("sl", 0),
-                        tp=pos.get("tp", 0),
                         result=result,
                         pnl_usdt=pnl,
                         open_time=pos["open_time"],
@@ -360,8 +362,8 @@ class OrderManager:
                         symbol=symbol,
                         direction=pos["direction"],
                         entry=pos["entry"],
-                        sl=pos.get("sl", 0),
-                        tp=pos.get("tp", 0),
+                        sl=0,    # nu mai folosim — Guardian dynamic
+                        tp=0,    # nu mai folosim — Guardian dynamic
                         result=result,
                         pnl_usdt=pnl,
                         usdt_per_trade=USDT_PER_TRADE,
@@ -401,8 +403,6 @@ class OrderManager:
                         "symbol":     symbol,
                         "direction":  oi.get("direction", "?"),
                         "entry":      oi.get("entry", 0),
-                        "sl":         0.0,
-                        "tp":         0.0,
                         "result":     "EXPIRED",
                         "pnl":        0.0,
                         "open_time":  oi.get("open_time", ""),
@@ -417,29 +417,28 @@ class OrderManager:
             self.pending_orders.pop(sym, None)
         return changed
 
-    # ─────────────────────────────────────────────
-    #  STATISTICI
-    # ─────────────────────────────────────────────
-
     def get_bot_stats(self) -> dict:
-        closed  = [x for x in self.closed_trades if x["result"] in ("TP", "SL")]
+        # Acum incluzând BE și TRAIL în "wins/losses" — clasificate pe pnl
+        closed  = [x for x in self.closed_trades if x["result"] in ("WIN", "BE", "SL", "EC", "TP", "TRAIL")]
         expired = [x for x in self.closed_trades if x["result"] == "EXPIRED"]
         if not closed:
             return {
-                "total": 0, "wins": 0, "losses": 0, "expired": len(expired),
+                "total": 0, "wins": 0, "losses": 0, "be": 0, "expired": len(expired),
                 "pnl_total": 0.0, "pnl_today": 0.0, "win_rate": 0.0,
                 "best": 0.0, "worst": 0.0,
                 "active": len(self.active_positions),
                 "pending": len(self.pending_orders),
             }
-        wins  = [x for x in closed if x["result"] == "TP"]
-        losses= [x for x in closed if x["result"] == "SL"]
-        pnls  = [x["pnl"] for x in closed]
+        wins   = [x for x in closed if x["pnl"] > 0]
+        losses = [x for x in closed if x["pnl"] < 0]
+        be     = [x for x in closed if x["result"] == "BE"]
+        pnls   = [x["pnl"] for x in closed]
         today = t.strftime("%Y-%m-%d", t.gmtime())
         return {
             "total":     len(closed),
             "wins":      len(wins),
             "losses":    len(losses),
+            "be":        len(be),
             "expired":   len(expired),
             "pnl_total": round(sum(pnls), 4),
             "pnl_today": round(sum(
@@ -453,10 +452,6 @@ class OrderManager:
             "pending":   len(self.pending_orders),
         }
 
-    # ─────────────────────────────────────────────
-    #  PLASARE TRADE
-    # ─────────────────────────────────────────────
-
     def set_leverage(self, symbol):
         try:
             self.client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
@@ -464,11 +459,6 @@ class OrderManager:
             logger.warning(f"[{symbol}] leverage: {e}")
 
     def place_fvg_trade(self, setup: FVGSetup) -> bool:
-        """
-        Plaseaza ordin LIMIT la entry.
-        NU plaseaza SL/TP — Guardian extern monitorizeaza si inchide pozitia
-        cand ROI atinge SL_NATURAL, TP_NATURAL sau EC_BACKUP.
-        """
         symbol = setup.symbol
         try:
             info    = self._get_symbol_info(symbol)
@@ -494,7 +484,7 @@ class OrderManager:
             order_id = order["orderId"]
             logger.info(
                 f"[{symbol}] LIMIT {side} | id={order_id} | "
-                f"qty={qty} | entry={entry_r} | Guardian protejeaza"
+                f"qty={qty} | entry={entry_r} | Trailing+BE protejează"
             )
             self.pending_orders[symbol] = {
                 "order_id":   order_id,
@@ -506,6 +496,9 @@ class OrderManager:
                 "open_ts":    open_ts,
                 "rsi":        getattr(setup, "rsi", 0.0),
                 "slope":      getattr(setup, "slope_fast", 0.0),
+                "gap_top":    getattr(setup, "gap_top", 0.0),
+                "gap_bot":    getattr(setup, "gap_bot", 0.0),
+                "atr":        getattr(setup, "atr", 0.0),
             }
             self._save()
             return True
@@ -520,10 +513,6 @@ class OrderManager:
             logger.error(f"[{symbol}] Eroare: {e}")
             return False
 
-    # ─────────────────────────────────────────────
-    #  UTILITARE
-    # ─────────────────────────────────────────────
-
     def count_active_trades(self):
         return len(self.pending_orders) + len(self.active_positions)
 
@@ -532,4 +521,3 @@ class OrderManager:
 
     def is_at_capacity(self):
         return self.count_active_trades() >= config.MAX_OPEN_TRADES
-
