@@ -1,19 +1,25 @@
 """
 ═══════════════════════════════════════════════════════════
-  FVG BOT 1H — v12 (REST + Anti-Restart + Anti-Rate-Limit)
+  FVG BOT 1H — v12.1 (REST + Smart Rate Limit Distinction)
 ═══════════════════════════════════════════════════════════
 Strategie de design: **PROFESIONAL ȘI PRUDENT**
+
+Schimbări față de v12:
+  ✓ FIX CRITIC: distincție între ban GLOBAL ("banned until X") și
+    rate limit PER-SYMBOL (scurt, doar pe acel simbol)
+  ✓ Pentru ban global → așteptare pasivă cu timestamp exact
+  ✓ Pentru rate limit per-symbol → SKIP simbolul, continuăm scan
+  ✓ Asta evită pierderea unui scan întreg pentru 1 simbol
 
 Schimbări față de v10/v11:
   ✓ ELIMINAT WebSocket (Binance Futures WS public blocat pe IP datacenter)
   ✓ ANTI-RESTART-LOOP: niciodată Exit cu non-zero — sleep infinit la failure
-    (împiedică Render auto-restart pe IP banat = ban prelungit)
   ✓ Skip reconcile dacă state file e recent (<10 min) — economie weight
-  ✓ Delay scan 1.0s (de la 0.4s) — burst weight redus la 300/min (din 750)
-  ✓ Cache exchange_info 60 min (de la default reload) — economie weight
+  ✓ Delay scan 1.0s — burst weight redus la 300/min
+  ✓ Cache exchange_info 60 min
   ✓ Backoff respectos: parsez timestamp ban din mesaj -1003, aștept exact
-  ✓ Cache floating loss 30s (deja era în v10)
-  ✓ Notify Telegram la startup și la rate limit prelungit
+  ✓ Cache floating loss 30s
+  ✓ Notify Telegram la startup
 """
 import sys, io, time, logging, os, json
 from datetime import datetime, timezone
@@ -97,7 +103,7 @@ class FVGBot1H:
         self._floating_loss_ts    = 0
 
         logger.info("═══════════════════════════════════════════════════════")
-        logger.info("  FVG BOT 1H — v12 (REST + Anti-Rate-Limit FINAL)")
+        logger.info("  FVG BOT 1H — v12.1 (REST + Smart Rate Limit)")
         logger.info(f"  TF: {config.TIMEFRAME} | Leverage: {config.LEVERAGE}x | USDT/trade: {config.USDT_PER_TRADE}")
         logger.info(f"  Detector: GAP%≥{config.MIN_GAP_PCT*100:.2f} | ATR_MULT≥{config.MIN_GAP_ATR_MULT}")
         logger.info(f"            RSI∈[{config.RSI_BULL_MIN},{config.RSI_BULL_MAX}] | AGGR={config.AGGR_FACTOR}")
@@ -226,10 +232,19 @@ class FVGBot1H:
             return klines[:-1]
         except BinanceAPIException as e:
             if e.code == -1003:
-                # Rate limit detectat → așteptăm pasiv până banul expiră
-                logger.warning(f"[{symbol}] rate limit la klines")
-                _wait_until_ban_expires(str(e))
-                return []
+                # Distincție critică:
+                # - "banned until <timestamp>" → ban GLOBAL pe IP, oprim tot scanul
+                # - alte mesaje -1003 → rate limit per-symbol/short, doar SKIP simbol
+                err_msg = str(e)
+                if "banned until" in err_msg:
+                    logger.warning(f"[{symbol}] BAN GLOBAL detectat → oprim scan")
+                    _wait_until_ban_expires(err_msg)
+                    raise  # propagăm ca să breakuim scan-ul în loop principal
+                else:
+                    # Rate limit scurt — pierdem 1 simbol, mergem mai departe
+                    logger.warning(f"[{symbol}] rate limit per-symbol — skip")
+                    time.sleep(2)  # mic backoff să nu spammăm imediat
+                    return []
             if e.code != -1121:
                 logger.warning(f"[{symbol}] klines: {e}")
             return []
@@ -407,9 +422,9 @@ class FVGBot1H:
                         if c1 or c3:
                             self.om._save()
                     except BinanceAPIException as e:
-                        if e.code == -1003:
+                        if e.code == -1003 and "banned until" in str(e):
                             _wait_until_ban_expires(str(e))
-                        else:
+                        elif e.code != -1003:
                             logger.error(f"Pending check: {e}")
                     except Exception as e:
                         logger.error(f"Pending check: {e}")
@@ -422,9 +437,9 @@ class FVGBot1H:
                         if c2:
                             self.om._save()
                     except BinanceAPIException as e:
-                        if e.code == -1003:
+                        if e.code == -1003 and "banned until" in str(e):
                             _wait_until_ban_expires(str(e))
-                        else:
+                        elif e.code != -1003:
                             logger.error(f"Active check: {e}")
                     except Exception as e:
                         logger.error(f"Active check: {e}")
@@ -475,11 +490,13 @@ class FVGBot1H:
                             self.scan_symbol(sym, capital)
                             scanned += 1
                         except BinanceAPIException as e:
-                            if e.code == -1003:
-                                _wait_until_ban_expires(str(e))
-                                break  # opresc scan, reîncerc next cycle
-                            else:
+                            # Ban global → break (get_klines a făcut deja așteptare pasivă)
+                            if e.code == -1003 and "banned until" in str(e):
+                                logger.warning("Ban global — opresc scan, reîncerc next cycle")
+                                break
+                            elif e.code != -1003:
                                 logger.error(f"[{sym}] BinanceError: {e}")
+                            # Rate limit per-symbol → continue (skip simbol, mergem mai departe)
                         except Exception as e:
                             logger.error(f"[{sym}] Eroare: {e}")
                         time.sleep(SCAN_DELAY_SEC)
