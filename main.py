@@ -1,33 +1,31 @@
 """
 ═══════════════════════════════════════════════════════════
-  FVG BOT 1H — v11 (WebSocket streaming)
+  FVG BOT 1H — v12 (REST + Anti-Restart + Anti-Rate-Limit)
 ═══════════════════════════════════════════════════════════
-Schimbări față de v10:
-  ✓ DATA prin WebSocket (zero rate limit, latență <100ms)
-  ✓ NU mai există scan secvențial — reacționăm la fiecare candle close
-  ✓ NU mai există SCAN_INTERVAL — fiecare simbol e detectat când 
-    candela lui se închide (la XX:00 UTC pentru 1H)
-  ✓ Păstrăm: PENDING check 30s, ACTIVE check 60s (REST necesar)
-  ✓ Păstrăm: cache capital 600s, cache floating loss 30s
+Strategie de design: **PROFESIONAL ȘI PRUDENT**
 
-Comportament:
-  - Pornire: descarcă istoric 200 bare/simbol via REST (~6 min)
-  - După: WS connection permanent, callback la fiecare candle close
-  - PENDING/ACTIVE checks rămân REST (necesare pentru orderuri)
+Schimbări față de v10/v11:
+  ✓ ELIMINAT WebSocket (Binance Futures WS public blocat pe IP datacenter)
+  ✓ ANTI-RESTART-LOOP: niciodată Exit cu non-zero — sleep infinit la failure
+    (împiedică Render auto-restart pe IP banat = ban prelungit)
+  ✓ Skip reconcile dacă state file e recent (<10 min) — economie weight
+  ✓ Delay scan 1.0s (de la 0.4s) — burst weight redus la 300/min (din 750)
+  ✓ Cache exchange_info 60 min (de la default reload) — economie weight
+  ✓ Backoff respectos: parsez timestamp ban din mesaj -1003, aștept exact
+  ✓ Cache floating loss 30s (deja era în v10)
+  ✓ Notify Telegram la startup și la rate limit prelungit
 """
-import sys, io, time, logging, threading
+import sys, io, time, logging, os, json
 from datetime import datetime, timezone
 from typing import Optional
 
-import pandas as pd
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 import config
-from detector import detect_fvg
+from detector import detect_fvg, prepare_df
 from order_manager import OrderManager
 from notifier import notify_setup, notify_trade, notify_error, send_statistics_report
-from ws_data_manager import WSDataManager
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -44,10 +42,51 @@ logging.basicConfig(
 logger = logging.getLogger("FVGBot1H")
 
 
+# ─── PARAMETRI ANTI-RATE-LIMIT (sigure profesional) ──────
+SCAN_DELAY_SEC      = 1.0    # delay între simboluri (era 0.4 → 1.0 = sub 300 weight/min)
+SCAN_INTERVAL_SEC   = 900    # 15 min (era 700 → 900 ca să avem buffer la finishing)
+PENDING_INTERVAL    = 30
+ACTIVE_INTERVAL     = 60
+EXCHANGE_INFO_TTL   = 3600   # 60 min cache
+RECONCILE_TTL_SEC   = 600    # skip reconcile dacă state file < 10 min vechime
+
+
+def _parse_ban_timestamp(error_msg: str) -> Optional[int]:
+    """Extrage timestamp-ul de unban din mesaj '-1003'."""
+    try:
+        # Format: "...IP(X.X.X.X) banned until 1777835098800. Please use..."
+        if "banned until" in error_msg:
+            parts = error_msg.split("banned until")
+            num_str = parts[1].strip().split(".")[0].split(" ")[0]
+            return int(num_str)
+    except Exception:
+        pass
+    return None
+
+
+def _wait_until_ban_expires(error_msg: str, max_wait: int = 7200):
+    """Așteaptă PASIV până când banul expiră. Maxim 2 ore."""
+    ban_ts = _parse_ban_timestamp(error_msg)
+    if ban_ts is None:
+        wait_s = 300  # 5 min default
+        logger.warning(f"Ban timestamp ne-parsabil. Aștept {wait_s}s default.")
+    else:
+        now_ms = int(time.time() * 1000)
+        wait_ms = max(60_000, ban_ts - now_ms + 30_000)  # min 60s, +30s buffer
+        wait_s = min(max_wait, wait_ms // 1000)
+        ban_dt = datetime.fromtimestamp(ban_ts/1000, tz=timezone.utc)
+        logger.warning(
+            f"Ban până la {ban_dt.strftime('%H:%M:%S')} UTC. "
+            f"Aștept PASIV {wait_s}s (NU fac API calls)."
+        )
+    time.sleep(wait_s)
+
+
 class FVGBot1H:
     def __init__(self):
         self.client           = Client(config.API_KEY, config.API_SECRET)
         self.om               = OrderManager(self.client)
+        self.last_candle_ts   = {}
         self.last_report_time = time.time()
         self.stats = {"start": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 
@@ -57,22 +96,15 @@ class FVGBot1H:
         self._floating_loss_cache = 0.0
         self._floating_loss_ts    = 0
 
-        # Lock pentru a serializa apelurile API din threads diferite
-        self._api_lock = threading.Lock()
-        # Lock pentru _on_candle_close (rulat din WS thread)
-        self._scan_lock = threading.Lock()
-
-        # WebSocket data manager
-        self.ws: Optional[WSDataManager] = None
-
         logger.info("═══════════════════════════════════════════════════════")
-        logger.info("  FVG BOT 1H — v11 (WebSocket streaming)")
+        logger.info("  FVG BOT 1H — v12 (REST + Anti-Rate-Limit FINAL)")
         logger.info(f"  TF: {config.TIMEFRAME} | Leverage: {config.LEVERAGE}x | USDT/trade: {config.USDT_PER_TRADE}")
         logger.info(f"  Detector: GAP%≥{config.MIN_GAP_PCT*100:.2f} | ATR_MULT≥{config.MIN_GAP_ATR_MULT}")
         logger.info(f"            RSI∈[{config.RSI_BULL_MIN},{config.RSI_BULL_MAX}] | AGGR={config.AGGR_FACTOR}")
         logger.info(f"            Wick≤{config.MAX_WICK_RATIO} | EMA slope≥{config.EMA_MIN_SLOPE*100:.2f}%")
         logger.info(f"  Entry: ENTRY_FILL_RATIO={config.ENTRY_FILL_RATIO} (mid-gap)")
         logger.info(f"  Max poziții: {config.MAX_OPEN_TRADES} | Expiry: {config.ORDER_EXPIRY_HOURS}h")
+        logger.info(f"  Scan delay: {SCAN_DELAY_SEC}s | Interval: {SCAN_INTERVAL_SEC}s")
         logger.info(f"  DLL: {config.DAILY_LOSS_LIMIT_PCT*100:.0f}% din capital/zi")
         logger.info("═══════════════════════════════════════════════════════")
 
@@ -83,32 +115,31 @@ class FVGBot1H:
         if self._cap_cache and (now_ts - self._cap_ts < 600):
             return self._cap_cache
 
-        with self._api_lock:
-            try:
-                bal = self.client.futures_account_balance()
-                cap = 0.0
-                for b in bal:
-                    if b.get("asset") == "USDT":
-                        v = float(b.get("walletBalance") or b.get("balance") or 0)
-                        if v > 0:
-                            cap = v
-                            break
-                if cap < 10:
-                    cap = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
-                self._cap_cache = cap
-                self._cap_ts    = now_ts
-                logger.info(f"Capital actualizat: {cap:.2f} USDT")
-            except BinanceAPIException as e:
-                if e.code == -1003:
-                    logger.warning("_get_capital: rate limit — folosesc cache")
-                else:
-                    logger.warning(f"_get_capital error: {e}")
-                if not self._cap_cache:
-                    self._cap_cache = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
-            except Exception as e:
+        try:
+            bal = self.client.futures_account_balance()
+            cap = 0.0
+            for b in bal:
+                if b.get("asset") == "USDT":
+                    v = float(b.get("walletBalance") or b.get("balance") or 0)
+                    if v > 0:
+                        cap = v
+                        break
+            if cap < 10:
+                cap = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
+            self._cap_cache = cap
+            self._cap_ts    = now_ts
+            logger.info(f"Capital actualizat: {cap:.2f} USDT")
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger.warning("_get_capital: rate limit — folosesc cache")
+            else:
                 logger.warning(f"_get_capital error: {e}")
-                if not self._cap_cache:
-                    self._cap_cache = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
+            if not self._cap_cache:
+                self._cap_cache = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
+        except Exception as e:
+            logger.warning(f"_get_capital error: {e}")
+            if not self._cap_cache:
+                self._cap_cache = config.USDT_PER_TRADE * config.MAX_OPEN_TRADES
 
         return self._cap_cache
 
@@ -118,25 +149,25 @@ class FVGBot1H:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def _get_floating_loss(self) -> float:
+        """Cache 30s pentru floating loss — evită 1 call/simbol."""
         now_ts = time.time()
         if (now_ts - self._floating_loss_ts) < 30:
             return self._floating_loss_cache
 
         floating_loss = 0.0
-        with self._api_lock:
-            try:
-                if self.om.active_positions:
-                    positions = self.client.futures_position_information()
-                    for p in positions:
-                        if p["symbol"] in self.om.active_positions:
-                            u = float(p.get("unRealizedProfit", 0))
-                            if u < 0:
-                                floating_loss += u
-            except BinanceAPIException as e:
-                if e.code == -1003:
-                    return self._floating_loss_cache
-            except Exception:
+        try:
+            if self.om.active_positions:
+                positions = self.client.futures_position_information()
+                for p in positions:
+                    if p["symbol"] in self.om.active_positions:
+                        u = float(p.get("unRealizedProfit", 0))
+                        if u < 0:
+                            floating_loss += u
+        except BinanceAPIException as e:
+            if e.code == -1003:
                 return self._floating_loss_cache
+        except Exception:
+            return self._floating_loss_cache
 
         self._floating_loss_cache = floating_loss
         self._floating_loss_ts    = now_ts
@@ -157,81 +188,94 @@ class FVGBot1H:
             return True
         return False
 
-    # ─── SIMBOLURI ──────────────────────────────────────────
+    # ─── SIMBOLURI (cache 60 min) ───────────────────────────
 
     def get_symbols(self) -> list:
         now_ts = time.time()
         cache  = getattr(self, "_symbols_cache", [])
-        if cache and (now_ts - getattr(self, "_symbols_ts", 0) < 900):
+        if cache and (now_ts - getattr(self, "_symbols_ts", 0) < EXCHANGE_INFO_TTL):
             return cache
-        with self._api_lock:
-            try:
-                info = self.client.futures_exchange_info()
-                syms = [
-                    s["symbol"] for s in info["symbols"]
-                    if s["symbol"].endswith("USDT")
-                    and s["status"] == "TRADING"
-                    and s["symbol"] not in config.BLACKLIST
-                ]
-                self._symbols_cache = syms
-                self._symbols_ts    = now_ts
-                logger.info(f"Simboluri actualizate: {len(syms)}")
-                return syms
-            except BinanceAPIException as e:
-                if e.code == -1003:
-                    logger.warning("get_symbols: rate limit — sleep 30s + retry")
-                    time.sleep(30)
-                    return cache
-                logger.error(f"get_symbols: {e}")
+        try:
+            info = self.client.futures_exchange_info()
+            syms = [
+                s["symbol"] for s in info["symbols"]
+                if s["symbol"].endswith("USDT")
+                and s["status"] == "TRADING"
+                and s["symbol"] not in config.BLACKLIST
+            ]
+            self._symbols_cache = syms
+            self._symbols_ts    = now_ts
+            logger.info(f"Simboluri actualizate: {len(syms)}")
+            return syms
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger.warning("get_symbols: rate limit (-1003)")
+                _wait_until_ban_expires(str(e))
                 return cache
-            except Exception as e:
-                logger.error(f"get_symbols: {e}")
-                return cache
+            logger.error(f"get_symbols: {e}")
+            return cache
+        except Exception as e:
+            logger.error(f"get_symbols: {e}")
+            return cache
 
-    # ─── CALLBACK CANDLE CLOSE (din WS thread) ──────────────
+    def get_klines(self, symbol: str) -> list:
+        try:
+            klines = self.client.futures_klines(
+                symbol=symbol, interval=config.TIMEFRAME, limit=200
+            )
+            return klines[:-1]
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                # Rate limit detectat → așteptăm pasiv până banul expiră
+                logger.warning(f"[{symbol}] rate limit la klines")
+                _wait_until_ban_expires(str(e))
+                return []
+            if e.code != -1121:
+                logger.warning(f"[{symbol}] klines: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"[{symbol}] klines: {e}")
+            return []
 
-    def _on_candle_close(self, symbol: str, df: pd.DataFrame):
-        """
-        Apelat de WSDataManager când o candelă se ÎNCHIDE.
-        Rulează detector pe df și plasează ordin dacă e cazul.
-        ATENȚIE: Rulează pe fir WebSocket — folosim _scan_lock pentru thread-safety.
-        """
-        with self._scan_lock:
-            try:
-                if df is None or len(df) < 100:
-                    return
-                
-                setup = detect_fvg(symbol, df)
-                if setup is None:
-                    return
-                
-                logger.info(
-                    f"[{symbol}] FVG {setup.direction} | RSI={setup.rsi} | "
-                    f"Entry={setup.entry:.6f} | Gap={setup.gap_bot:.6f}↔{setup.gap_top:.6f} | "
-                    f"ATR={setup.atr:.6f} | Slope={setup.slope_fast:+.3f}%"
-                )
-                
-                # Capital + DLL
-                capital = self._get_capital()
-                if self._dll_active(capital):
-                    logger.info(f"[{symbol}] SKIP — DLL activ")
-                    return
-                
-                if self.om.has_symbol(symbol):
-                    return
-                
-                if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
-                    logger.info(f"[{symbol}] SKIP — limită {config.MAX_OPEN_TRADES} atinsă")
-                    return
-                
-                # Plasează ordinul (cu API lock)
-                with self._api_lock:
-                    notify_setup(setup)
-                    success = self.om.place_fvg_trade(setup)
-                    notify_trade(setup, success)
-            
-            except Exception as e:
-                logger.error(f"[{symbol}] _on_candle_close error: {e}")
+    # ─── SCAN ───────────────────────────────────────────────
+
+    def scan_symbol(self, symbol: str, capital: float):
+        klines = self.get_klines(symbol)
+        if not klines:
+            return
+
+        df      = prepare_df(klines)
+        last_ts = df.index[-1]
+
+        if self.last_candle_ts.get(symbol) == last_ts:
+            return
+
+        setup = detect_fvg(symbol, df)
+        self.last_candle_ts[symbol] = last_ts
+
+        if setup is None:
+            return
+
+        logger.info(
+            f"[{symbol}] FVG {setup.direction} | RSI={setup.rsi} | "
+            f"Entry={setup.entry:.6f} | Gap={setup.gap_bot:.6f}↔{setup.gap_top:.6f} | "
+            f"ATR={setup.atr:.6f} | Slope={setup.slope_fast:+.3f}%"
+        )
+
+        if self._dll_active(capital):
+            logger.info(f"[{symbol}] SKIP — DLL activ")
+            return
+
+        if self.om.has_symbol(symbol):
+            return
+
+        if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
+            logger.info(f"[{symbol}] SKIP — limită {config.MAX_OPEN_TRADES} atinsă")
+            return
+
+        notify_setup(setup)
+        success = self.om.place_fvg_trade(setup)
+        notify_trade(setup, success)
 
     # ─── RAPORT ─────────────────────────────────────────────
 
@@ -240,8 +284,6 @@ class FVGBot1H:
             today    = self._today()
             bstats   = self.om.get_bot_stats()
             dll_today = self.om.daily_pnl.get(today, 0.0)
-            ws_status = self.ws.get_status() if self.ws else {}
-            
             send_statistics_report({
                 "total_trades":   bstats["total"],
                 "wins":           bstats["wins"],
@@ -261,106 +303,225 @@ class FVGBot1H:
                 "timeframe":      config.TIMEFRAME,
             })
             self.last_report_time = time.time()
-            logger.info(f"Raport Telegram trimis. WS status: {ws_status.get('candles_closed',0)} candele primite, healthy={ws_status.get('is_healthy')}")
+            logger.info("Raport Telegram trimis.")
 
-    # ─── RUN ────────────────────────────────────────────────
+    # ─── SMART RECONCILE ─────────────────────────────────────
+
+    def _smart_reconcile(self):
+        """
+        Skip reconcile dacă state file e recent (<10 min vechime).
+        Asta economisește 45+ weight la fiecare restart Render.
+        """
+        sf = getattr(config, "STATE_FILE", "bot_state_1h.json")
+        try:
+            if os.path.exists(sf):
+                mtime = os.path.getmtime(sf)
+                age = time.time() - mtime
+                if age < RECONCILE_TTL_SEC:
+                    logger.info(
+                        f"State file recent ({age:.0f}s). SKIP reconcile "
+                        f"(economie ~45 weight)."
+                    )
+                    return
+        except Exception:
+            pass
+
+        logger.info("State file vechi sau lipsă → fac reconcile cu Binance...")
+        try:
+            self.om.reconcile_with_binance()
+        except Exception as e:
+            logger.warning(f"Reconcile error: {e}")
+            if "-1003" in str(e):
+                _wait_until_ban_expires(str(e))
+
+    # ═══════════════════════════════════════════════════════
+    #  RUN — REST polling cu anti-restart
+    # ═══════════════════════════════════════════════════════
+
+    def _wait_passive_forever(self, reason: str):
+        """Sleep infinit pasiv — pentru a preveni Render auto-restart."""
+        logger.error(f"BOT INTRĂ ÎN SLEEP INFINIT: {reason}")
+        logger.error("Pentru a-l reporni: Render Dashboard → Manual Deploy.")
+        try:
+            notify_error("Bot 1H — Sleep mode", reason[:200])
+        except Exception:
+            pass
+        while True:
+            time.sleep(3600)
 
     def run(self):
-        """
-        Triple loop:
-        - PENDING (30s):  REST check ordine umplute
-        - ACTIVE  (60s):  REST check pozitii inchise
-        - WS:             primeste candele live -> callback -> detector + plasare
-        """
-        logger.info("Reconciliere cu Binance...")
-        self.om.reconcile_with_binance()
-        
-        # Pornire WebSocket
-        symbols = self.get_symbols()
+        # ── PASUL 1: Smart reconcile (skip dacă state file recent) ─
+        self._smart_reconcile()
+
+        # ── PASUL 2: Get symbols (cu retry pasiv robust) ──
+        symbols = []
+        attempt = 0
+        max_attempts = 20
+
+        while not symbols and attempt < max_attempts:
+            attempt += 1
+            symbols = self.get_symbols()
+            if symbols:
+                break
+
+            wait_s = min(120 * attempt, 1800)
+            logger.warning(
+                f"Nu am simboluri (incercare {attempt}/{max_attempts}). "
+                f"Aștept PASIV {wait_s}s — NU fac API calls."
+            )
+            if attempt == 5:
+                try:
+                    notify_error("Bot 1H startup",
+                                 f"Rate limit persistent — incercare {attempt}")
+                except Exception:
+                    pass
+            time.sleep(wait_s)
+
         if not symbols:
-            logger.error("Nu am putut obtine lista simboluri. Stop.")
-            return
-        
-        logger.info(f"Inițializare WebSocket pentru {len(symbols)} simboluri...")
-        self.ws = WSDataManager(self.client, config.TIMEFRAME, on_candle_close=self._on_candle_close)
-        
-        # Init buffers (REST, ~6 min cu delay 0.6s)
-        self.ws.init_buffers(symbols, delay_per_symbol=0.6)
-        
-        # Pornire WebSocket
-        self.ws.start(symbols)
-        
-        logger.info("Bot 1H pornit (WebSocket streaming). Ctrl+C pentru oprire.")
+            self._wait_passive_forever(
+                "Nu pot obtine simboluri după 20 incercări (~5h cumulativ). "
+                "IP probabil banat persistent. Manual Deploy când vrei să încerci din nou."
+            )
+            return  # never reached
 
-        PENDING_INTERVAL = 30
-        ACTIVE_INTERVAL  = 60
-        WS_HEALTH_INTERVAL = 300  # health check la 5 min
+        logger.info(f"✓ {len(symbols)} simboluri obținute")
+        try:
+            notify_error("Bot 1H pornit", f"v12 REST | {len(symbols)} simboluri")
+        except Exception:
+            pass
 
+        # ── PASUL 3: Loop principal cu auto-recovery ────────
         last_pending = 0
         last_active  = 0
-        last_health  = time.time()
+        last_scan    = 0
 
-        try:
-            while True:
+        while True:
+            try:
                 now = time.time()
 
-                # PENDING (30s) — REST necesar
+                # PENDING (30s)
                 if now - last_pending >= PENDING_INTERVAL:
                     try:
-                        with self._api_lock:
-                            c1 = self.om._check_pending()
-                            c3 = self.om._expire_old_orders()
+                        c1 = self.om._check_pending()
+                        c3 = self.om._expire_old_orders()
                         if c1 or c3:
                             self.om._save()
                     except BinanceAPIException as e:
-                        if e.code != -1003:
+                        if e.code == -1003:
+                            _wait_until_ban_expires(str(e))
+                        else:
                             logger.error(f"Pending check: {e}")
                     except Exception as e:
                         logger.error(f"Pending check: {e}")
                     last_pending = time.time()
 
-                # ACTIVE (60s) — REST necesar
+                # ACTIVE (60s)
                 if now - last_active >= ACTIVE_INTERVAL:
                     try:
-                        with self._api_lock:
-                            c2 = self.om._check_active_positions()
+                        c2 = self.om._check_active_positions()
                         if c2:
                             self.om._save()
                     except BinanceAPIException as e:
-                        if e.code != -1003:
+                        if e.code == -1003:
+                            _wait_until_ban_expires(str(e))
+                        else:
                             logger.error(f"Active check: {e}")
                     except Exception as e:
                         logger.error(f"Active check: {e}")
                     last_active = time.time()
 
-                # WS HEALTH (5 min) — printez status pentru monitorizare
-                if now - last_health >= WS_HEALTH_INTERVAL:
-                    if self.ws:
-                        s = self.ws.get_status()
-                        active = self.om.count_active_trades()
-                        pending = len(self.om.pending_orders)
-                        logger.info(
-                            f"WS status: {s['candles_closed']} candele închise | "
-                            f"{s['callbacks_fired']} detectoari rulați | "
-                            f"reconnects={s['reconnects']} | errors={s['errors']} | "
-                            f"healthy={s['is_healthy']} | "
-                            f"Pozitii: {active}/{config.MAX_OPEN_TRADES} | Pending: {pending} | "
-                            f"DLL azi: {self.om.daily_pnl.get(self._today(), 0):+.2f}"
-                        )
+                # SCAN (900s = 15 min)
+                if now - last_scan >= SCAN_INTERVAL_SEC:
+                    active  = self.om.count_active_trades()
+                    pending = len(self.om.pending_orders)
+
+                    if active >= config.MAX_OPEN_TRADES:
+                        logger.info(f"PAUZĂ — {active}/{config.MAX_OPEN_TRADES} poziții")
+                        self.check_and_send_report()
+                        last_scan = time.time()
+                        continue
+
+                    capital = self._get_capital()
+
+                    if self._dll_active(capital):
+                        logger.info(f"PAUZĂ ZILNICĂ — DLL activ | {active} poziții")
+                        self.check_and_send_report()
+                        last_scan = time.time()
+                        continue
+
+                    symbols    = self.get_symbols()
+                    if not symbols:
+                        logger.warning("Scan skipped — fără simboluri")
+                        last_scan = time.time()
+                        continue
+                    
+                    scan_start = time.time()
+                    logger.info(
+                        f"SCAN COMPLET: {len(symbols)} perechi | "
+                        f"Poziții: {active}/{config.MAX_OPEN_TRADES} | "
+                        f"Pending: {pending} | "
+                        f"DLL azi: {self.om.daily_pnl.get(self._today(), 0):+.2f} USDT"
+                    )
+
+                    scanned = 0
+                    for sym in symbols:
+                        if self.om.count_active_trades() >= config.MAX_OPEN_TRADES:
+                            logger.info("Limită atinsă — opresc scan")
+                            break
+                        if self._dll_active(capital):
+                            logger.info("DLL atins — opresc scan")
+                            break
+                        try:
+                            self.scan_symbol(sym, capital)
+                            scanned += 1
+                        except BinanceAPIException as e:
+                            if e.code == -1003:
+                                _wait_until_ban_expires(str(e))
+                                break  # opresc scan, reîncerc next cycle
+                            else:
+                                logger.error(f"[{sym}] BinanceError: {e}")
+                        except Exception as e:
+                            logger.error(f"[{sym}] Eroare: {e}")
+                        time.sleep(SCAN_DELAY_SEC)
+
+                    scan_dur = time.time() - scan_start
+                    logger.info(
+                        f"Ciclu complet | "
+                        f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | "
+                        f"Scanate: {scanned}/{len(symbols)} în {scan_dur:.0f}s | "
+                        f"Poziții: {self.om.count_active_trades()}/{config.MAX_OPEN_TRADES}"
+                    )
+
                     self.check_and_send_report()
-                    last_health = time.time()
+                    last_scan = time.time()
 
                 time.sleep(2)
 
-        except KeyboardInterrupt:
-            logger.info("Bot oprit manual.")
-        except Exception as e:
-            logger.error(f"Eroare loop: {e}")
-            notify_error("Loop 1H", str(e))
-        finally:
-            if self.ws:
-                self.ws.stop()
+            except KeyboardInterrupt:
+                logger.info("Bot oprit manual.")
+                break
+            except Exception as e:
+                # CRITIC: NU IES — log și continui
+                logger.error(f"Eroare iterație loop (continui): {type(e).__name__}: {e}")
+                try:
+                    notify_error("Loop 1H", str(e)[:200])
+                except Exception:
+                    pass
+                time.sleep(30)
 
 
 if __name__ == "__main__":
-    FVGBot1H().run()
+    try:
+        FVGBot1H().run()
+    except KeyboardInterrupt:
+        logger.info("Botul s-a oprit la cerere utilizator.")
+    except Exception as e:
+        # Last resort: sleep infinit pentru a preveni Render auto-restart loop
+        logger.critical(f"FATAL: {type(e).__name__}: {e}")
+        logger.critical("Sleep infinit pentru a preveni Render auto-restart loop.")
+        try:
+            notify_error("Bot 1H FATAL", str(e)[:200])
+        except Exception:
+            pass
+        while True:
+            time.sleep(3600)
